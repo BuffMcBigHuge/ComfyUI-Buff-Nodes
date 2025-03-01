@@ -1,0 +1,14 @@
+[project]
+name = "ComfyUI-Buff-Nodes"
+description = "Assorted Nodes by BuffMcBigHuge"
+version = "1.0.0"
+license = {text = "MIT License"}
+
+[project.urls]
+Repository = "https://github.com/BuffMcBigHuge/ComfyUI-Buff-Nodes"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "buffmcbighuge"
+DisplayName = "ComfyUI-Buff-Nodes"
+Icon = ""
