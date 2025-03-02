@@ -1,9 +1,12 @@
+'''
+Buff.py
+Created by: https://github.com/BuffMcBigHuge
+'''
+
 import os
 import random
 import folder_paths
 import json
-import glob
-from pathlib import Path
 import time
 import os.path
 import fnmatch
@@ -26,13 +29,13 @@ class FilePathSelectorFromDirectory:
         return {
             "required": {
                 "directory_path": ("STRING", {"default": folder_paths.get_input_directory()}),
-                "file_types": ("STRING", {"default": "mp4"}),
+                "file_types": ("STRING", {"default": "mp4,mkv,webm"}),
                 "selection_mode": (["randomize", "sequential"], {"default": "randomize"}),
+                "include_subdirectories": (["True", "False"], {"default": "True"}),
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "cache_duration": ("INT", {"default": 60, "min": 0, "max": 3600}),
-                "optimize_random": (["True", "False"], {"default": "True"}),
             }
         }
 
@@ -41,10 +44,10 @@ class FilePathSelectorFromDirectory:
     FUNCTION = "select_file"
     CATEGORY = "utils"
 
-    def get_file_count(self, directory_path, extensions, use_cache=True, cache_duration=None):
+    def get_file_count(self, directory_path, extensions, use_cache=True, cache_duration=None, include_subdirectories="False"):
         """Get the count of matching files in a directory without loading all filenames."""
         # Create a unique key for this directory + file types combination
-        dir_key = f"{directory_path}_{','.join(extensions)}"
+        dir_key = f"{directory_path}_{','.join(extensions)}_{include_subdirectories}"
         
         # Use cache if available and not expired
         current_time = time.time()
@@ -58,11 +61,15 @@ class FilePathSelectorFromDirectory:
         
         # Count files efficiently
         count = 0
-        for ext in extensions:
-            pattern = f"*{ext}"
-            # Use os.scandir which is more efficient than glob for just counting
-            for _ in fnmatch.filter([entry.name for entry in os.scandir(directory_path) if entry.is_file()], pattern):
-                count += 1
+        if include_subdirectories == "True":
+            for root, _, files in os.walk(directory_path):
+                for ext in extensions:
+                    pattern = f"*{ext}"
+                    count += len(fnmatch.filter(files, pattern))
+        else:
+            for ext in extensions:
+                pattern = f"*{ext}"
+                count += len(fnmatch.filter([entry.name for entry in os.scandir(directory_path) if entry.is_file()], pattern))
         
         # Update cache
         self.file_count_cache[dir_key] = {
@@ -87,7 +94,7 @@ class FilePathSelectorFromDirectory:
         
         return ""  # Not found
 
-    def select_random_file_optimized(self, directory_path, extensions, seed=None):
+    def select_random_file(self, directory_path, extensions, seed=None):
         """Select a random file without loading all files into memory."""
         # Get file count
         file_count = self.get_file_count(directory_path, extensions)
@@ -110,10 +117,10 @@ class FilePathSelectorFromDirectory:
         
         return selected_file
 
-    def get_matching_files(self, directory_path, extensions, use_cache=True, cache_duration=None):
+    def get_matching_files(self, directory_path, extensions, use_cache=True, cache_duration=None, include_subdirectories="False"):
         """Get matching files using efficient methods based on the selection mode."""
         # Create a unique key for this directory + file types combination
-        dir_key = f"{directory_path}_{','.join(extensions)}"
+        dir_key = f"{directory_path}_{','.join(extensions)}_{include_subdirectories}"
         
         # Use cache if available and not expired
         current_time = time.time()
@@ -125,13 +132,19 @@ class FilePathSelectorFromDirectory:
             if current_time - cache_time < expiry:
                 return cache_entry["files"]
         
-        # Use scandir which is more efficient than glob for most cases
         matching_files = []
-        for ext in extensions:
-            pattern = f"*{ext}"
-            for entry in os.scandir(directory_path):
-                if entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
-                    matching_files.append(os.path.join(directory_path, entry.name))
+        if include_subdirectories == "True":
+            for root, _, files in os.walk(directory_path):
+                for ext in extensions:
+                    pattern = f"*{ext}"
+                    for file in fnmatch.filter(files, pattern):
+                        matching_files.append(os.path.join(root, file))
+        else:
+            for ext in extensions:
+                pattern = f"*{ext}"
+                for entry in os.scandir(directory_path):
+                    if entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
+                        matching_files.append(os.path.join(directory_path, entry.name))
         
         # Sort files for consistent access
         matching_files.sort()
@@ -143,25 +156,6 @@ class FilePathSelectorFromDirectory:
         }
         
         return matching_files
-
-    def select_random_file(self, directory_path, extensions, seed=None):
-        """Efficiently select a random file."""
-        matching_files = self.get_matching_files(directory_path, extensions)
-        
-        if not matching_files:
-            return ""
-            
-        # Use seeded random if provided
-        if seed is not None:
-            rng = random.Random(seed)
-            selected_file = rng.choice(matching_files)
-            print(f"Selected randomized file with seed {seed}: {selected_file}")
-        else:
-            # Use system random
-            selected_file = random.choice(matching_files)
-            print(f"Selected randomized file (unseeded): {selected_file}")
-            
-        return selected_file
 
     def select_sequential_file(self, directory_path, extensions, dir_key):
         """Select a file sequentially from the directory."""
@@ -190,7 +184,7 @@ class FilePathSelectorFromDirectory:
         print(f"Selected sequential file ({current_index + 1}/{len(matching_files)}): {selected_file}")
         return selected_file
 
-    def select_file(self, directory_path, file_types, selection_mode, seed=None, cache_duration=60, optimize_random="True"):
+    def select_file(self, directory_path, file_types, selection_mode, include_subdirectories="False", seed=None, cache_duration=60):
         # Strip quotation marks from directory path if present
         directory_path = directory_path.strip('"\'')
         
@@ -205,19 +199,14 @@ class FilePathSelectorFromDirectory:
         extensions = ["." + ext if not ext.startswith(".") else ext for ext in extensions]
         
         # Create a unique key for this directory + file types combination
-        dir_key = f"{directory_path}_{file_types}"
+        dir_key = f"{directory_path}_{file_types}_{include_subdirectories}"
         
         # Update cache duration if provided
         if cache_duration is not None and cache_duration != 60:
             self.CACHE_EXPIRY = cache_duration
         
         if selection_mode == "randomize":
-            if optimize_random == "True":
-                # Use optimized random selection that doesn't load all files
-                selected_file = self.select_random_file_optimized(directory_path, extensions, seed)
-            else:
-                # Use standard random selection that loads all files
-                selected_file = self.select_random_file(directory_path, extensions, seed)
+            selected_file = self.select_random_file(directory_path, extensions, seed) 
         else:
             selected_file = self.select_sequential_file(directory_path, extensions, dir_key)
             

@@ -6,7 +6,7 @@ NODE_CLASS_MAPPINGS = {
     "ConsoleOutput": ConsoleOutput
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FilePathSelectorFromDirectory": "File Path Selector From Directory",
-    "StringProcessor": "String Processor",
-    "ConsoleOutput": "Console Output"
+    "FilePathSelectorFromDirectory": "File Path Selector From Directory (Buff)",
+    "StringProcessor": "String Processor (Buff)",
+    "ConsoleOutput": "Console Output (Buff)"
 }
