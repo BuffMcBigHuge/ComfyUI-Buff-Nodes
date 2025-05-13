@@ -14,7 +14,9 @@ The `FilePathSelectorFromDirectory` node is a utility for ComfyUI that helps you
 - **Selection Modes**:
   - **Randomize**: Pick a random file from the directory (can be seeded for reproducibility)
   - **Sequential**: Go through files one by one in alphabetical order, remembering position between runs
+- **Subdirectory Support**: Optionally search through subdirectories for matching files
 - **Persistent Memory**: Tracks the sequential position between ComfyUI sessions
+- **Caching**: Efficient file list caching with configurable duration
 
 ## String Processor Node
 
@@ -37,6 +39,62 @@ The `ConsoleOutput` node provides a simple way to display text in the console:
   - Acts as a terminal output node in workflows
   - Useful for debugging or logging information
 
+## Most Recent File Selector Node
+
+The `MostRecentFileSelector` node finds the most recently modified file in a specified directory:
+- **Features**:
+  - Automatically detects the most recently modified file in a directory
+  - Optional file type filtering using comma-separated extensions
+  - Can create a black initialization image if no file is found
+  - Configurable black image dimensions and format
+- **Input Options**:
+  - **Directory Path**: Path to search for files (defaults to ComfyUI's input directory)
+  - **File Types**: Optional comma-separated list of file extensions to filter by (e.g., "png,jpg")
+  - **Create Init Image**: Option to create a black image if no file is found
+  - **Init Image Settings**: Configurable width, height, and format (png/jpg) for the black image
+- **Output**:
+  - Returns the full path to the most recent file
+  - Returns an empty string if no file is found and init image creation is disabled
+  - Creates and returns path to a black image if no file is found and init image creation is enabled
+- **Behavior**:
+  - Always re-executes when the workflow is queued
+  - Handles missing directories gracefully
+  - Provides detailed console logging for debugging
+
+## Two Image Concatenator Node
+
+> Note: The following node is for the use of [TemporalNet2](https://huggingface.co/CiaraRowles/TemporalNet2) in video streaming workflows
+
+The `TwoImageConcatenator` node combines two 3-channel images into a single 6-channel image:
+- **Features**:
+  - Concatenates two input images along the channel dimension
+  - Maintains batch processing capability
+  - Useful for temporal models that require both previous and current frames
+  - Preserves image dimensions while doubling the channel count
+- **Input Requirements**:
+  - Both images must have the same batch size, height, and width
+  - Both images must be 3-channel images
+- **Output**:
+  - Single 6-channel image tensor (batch, height, width, 6 channels)
+
+## Raft Optical Flow Node
+
+> Note: The following node is for the use of [TemporalNet2](https://huggingface.co/CiaraRowles/TemporalNet2) in video streaming workflows
+
+The `RaftOpticalFlowNode` calculates optical flow between two images using the RAFT (Recurrent All-Pairs Field Transforms) model:
+- **Features**:
+  - Uses the state-of-the-art RAFT model for optical flow estimation
+  - Processes images in batches
+  - Automatically handles device placement (CPU/GPU)
+  - Produces a visualization of motion between frames
+- **Input Requirements**:
+  - Two input images (typically previous and current frames)
+  - Images should be in ComfyUI's standard format (batch, height, width, channels)
+- **Output**:
+  - Optical flow visualization as an image
+  - Color-coded representation of motion between frames
+  - Output is normalized to [0,1] range
+
 ## Use Cases
 
 - Randomly selecting input files for processing
@@ -45,9 +103,18 @@ The `ConsoleOutput` node provides a simple way to display text in the console:
 - Extracting portions of text from larger strings
 - Debugging workflows by logging intermediate values to the console
 - Formatting and transforming text for use in prompts or file operations
+- Processing video frames for motion analysis
+- Combining multiple image channels for temporal models
+- Visualizing motion between consecutive frames
+- Finding the latest output from a previous workflow run
+- Creating initialization images for new workflows
+- Monitoring directories for new files
+- Setting up automated workflows that process the most recent file
 
 ## Technical Details
 
 The File Path Selector node saves its sequential position state to a JSON file, allowing it to remember where it left off even if you restart ComfyUI. When using the randomize mode with a seed, you'll get consistent, reproducible selections.
 
 The String Processor supports Python expressions that give you the full power of string manipulation in a controlled environment.
+
+The Raft Optical Flow Node uses the RAFT model from torchvision, which provides high-quality optical flow estimation. The model is automatically downloaded when first used and cached for subsequent runs.
