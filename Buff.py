@@ -222,7 +222,7 @@ class FilePathSelectorFromDirectory:
         # Ensure directory_path is a valid directory
         if not os.path.isdir(directory_path):
             print(f"Error: {directory_path} is not a valid directory")
-            return None
+            return ("",)
         
         # Clear cache if needed to ensure fresh results
         self.clear_cache()
@@ -235,10 +235,11 @@ class FilePathSelectorFromDirectory:
             dir_key = f"{directory_path}_{file_types}_{include_subdirectories}"
             result = self.select_sequential_file(directory_path, extensions, dir_key, include_subdirectories=include_subdirectories)
         
-        # Debug output
+        # Debug output - show raw path without quotes
         print(f"Selected file: {result}")
         
-        return result
+        # Return raw path without any quoting
+        return (result if result else "",) 
 
     # Optional: Clear cache method
     @classmethod
