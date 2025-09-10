@@ -624,6 +624,173 @@ class RaftOpticalFlowNode:
         return (flow_vis,)
 
 
+class FrameRateModulator:
+    """Modulates the frame rate of an image sequence by resampling frames to achieve target frame count or multiplier."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Input batch of images to resample"
+                }),
+                "mode": (["frame_count", "multiplier"], {
+                    "default": "frame_count",
+                    "tooltip": "frame_count: Set exact number of output frames\nmultiplier: Scale input frame count by a factor"
+                }),
+            },
+            "optional": {
+                "target_frame_count": ("INT", {
+                    "default": 30,
+                    "min": 1,
+                    "max": 10000,
+                    "tooltip": "Target number of frames for output (used when mode is 'frame_count')"
+                }),
+                "frame_multiplier": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.1,
+                    "max": 10.0,
+                    "step": 0.1,
+                    "tooltip": "Multiplier for frame count (used when mode is 'multiplier'). 2.0 = double frames (slow motion), 0.5 = half frames (speed up)"
+                }),
+                "interpolation": (["nearest", "linear", "cubic"], {
+                    "default": "linear",
+                    "tooltip": "Interpolation method:\nnearest: No interpolation, duplicate/skip frames\nlinear: Linear blending between adjacent frames\ncubic: Smooth cubic interpolation"
+                }),
+                "loop_mode": (["clamp", "repeat", "mirror"], {
+                    "default": "clamp",
+                    "tooltip": "How to handle out-of-bounds frames:\nclamp: Use first/last frame\nrepeat: Loop the sequence\nmirror: Reverse and repeat"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("images", "frame_count")
+    FUNCTION = "modulate_framerate"
+    CATEGORY = "Image/Animation"
+
+    def get_frame_at_position(self, images, position, loop_mode):
+        """Get frame at a specific position, handling out-of-bounds with loop_mode."""
+        total_frames = images.shape[0]
+        
+        if loop_mode == "clamp":
+            # Clamp to valid range
+            idx = max(0, min(total_frames - 1, int(position)))
+            return images[idx]
+        elif loop_mode == "repeat":
+            # Loop the sequence
+            idx = int(position) % total_frames
+            return images[idx]
+        elif loop_mode == "mirror":
+            # Mirror the sequence
+            cycle_length = (total_frames - 1) * 2
+            pos_in_cycle = int(position) % cycle_length
+            if pos_in_cycle < total_frames:
+                return images[pos_in_cycle]
+            else:
+                mirror_idx = cycle_length - pos_in_cycle
+                return images[mirror_idx]
+        
+        return images[0]  # fallback
+
+    def interpolate_frames(self, images, positions, interpolation, loop_mode):
+        """Interpolate frames at given positions."""
+        device = images.device
+        dtype = images.dtype
+        batch_size, height, width, channels = images.shape
+        output_frames = len(positions)
+        
+        result = torch.zeros((output_frames, height, width, channels), dtype=dtype, device=device)
+        
+        for i, pos in enumerate(positions):
+            if interpolation == "nearest":
+                # Simple nearest neighbor
+                result[i] = self.get_frame_at_position(images, round(pos), loop_mode)
+            
+            elif interpolation == "linear":
+                # Linear interpolation between adjacent frames
+                pos_floor = int(torch.floor(torch.tensor(pos)).item())
+                pos_ceil = pos_floor + 1
+                alpha = pos - pos_floor
+                
+                frame_a = self.get_frame_at_position(images, pos_floor, loop_mode)
+                frame_b = self.get_frame_at_position(images, pos_ceil, loop_mode)
+                
+                result[i] = frame_a * (1 - alpha) + frame_b * alpha
+            
+            elif interpolation == "cubic":
+                # Cubic interpolation using 4 points
+                pos_int = int(pos)
+                alpha = pos - pos_int
+                
+                # Get 4 surrounding frames
+                p0 = self.get_frame_at_position(images, pos_int - 1, loop_mode)
+                p1 = self.get_frame_at_position(images, pos_int, loop_mode)
+                p2 = self.get_frame_at_position(images, pos_int + 1, loop_mode)
+                p3 = self.get_frame_at_position(images, pos_int + 2, loop_mode)
+                
+                # Cubic interpolation formula
+                a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+                b = p0 - 2.5 * p1 + 2 * p2 - 0.5 * p3
+                c = -0.5 * p0 + 0.5 * p2
+                d = p1
+                
+                result[i] = a * (alpha ** 3) + b * (alpha ** 2) + c * alpha + d
+                
+                # Clamp values to valid range
+                result[i] = torch.clamp(result[i], 0.0, 1.0)
+        
+        return result
+
+    def modulate_framerate(self, images, mode, target_frame_count=30, frame_multiplier=1.0, 
+                          interpolation="linear", loop_mode="clamp"):
+        """
+        Modulate the frame rate of an image sequence.
+        
+        Args:
+            images: Input batch of images [batch, height, width, channels]
+            mode: "frame_count" or "multiplier"
+            target_frame_count: Target number of output frames
+            frame_multiplier: Multiplier for frame count
+            interpolation: Interpolation method ("nearest", "linear", "cubic")
+            loop_mode: How to handle out-of-bounds ("clamp", "repeat", "mirror")
+        
+        Returns:
+            tuple: (resampled_images, output_frame_count)
+        """
+        input_frame_count = images.shape[0]
+        
+        # Determine output frame count
+        if mode == "frame_count":
+            output_frame_count = target_frame_count
+        else:  # multiplier
+            output_frame_count = max(1, int(input_frame_count * frame_multiplier))
+        
+        print(f"FrameRateModulator: {input_frame_count} → {output_frame_count} frames "
+              f"(mode: {mode}, interpolation: {interpolation})")
+        
+        # If no change needed, return original
+        if output_frame_count == input_frame_count:
+            return (images, input_frame_count)
+        
+        # Calculate positions for resampling
+        if output_frame_count == 1:
+            # Special case: single frame output
+            positions = [input_frame_count // 2]
+        else:
+            # Map output frames to input positions
+            positions = []
+            for i in range(output_frame_count):
+                # Map from [0, output_frame_count-1] to [0, input_frame_count-1]
+                pos = i * (input_frame_count - 1) / (output_frame_count - 1)
+                positions.append(pos)
+        
+        # Perform interpolation
+        resampled_images = self.interpolate_frames(images, positions, interpolation, loop_mode)
+        
+        return (resampled_images, output_frame_count)
+
+
 class MostRecentFileSelector:
     """Selects the most recently modified file in a given directory, or creates a black image if none found."""
 

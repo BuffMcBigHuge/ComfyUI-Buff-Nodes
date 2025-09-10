@@ -77,6 +77,32 @@ The `TwoImageConcatenator` node combines two 3-channel images into a single 6-ch
 - **Output**:
   - Single 6-channel image tensor (batch, height, width, 6 channels)
 
+## Frame Rate Modulator Node
+
+The `FrameRateModulator` node allows you to modify the frame rate of image sequences by resampling frames:
+- **Features**:
+  - **Mode Selection**: Choose between exact frame count or multiplier-based resampling
+  - **Frame Count Mode**: Set a specific target number of output frames
+  - **Multiplier Mode**: Scale input frame count by a factor (2.0 = slow motion, 0.5 = speed up)
+  - **Interpolation Methods**:
+    - **Nearest**: Simple frame duplication/skipping (fastest)
+    - **Linear**: Smooth blending between adjacent frames
+    - **Cubic**: High-quality cubic interpolation for smooth motion
+  - **Loop Modes** for handling edge cases:
+    - **Clamp**: Use first/last frame for out-of-bounds positions
+    - **Repeat**: Loop the sequence seamlessly
+    - **Mirror**: Reverse and repeat for ping-pong effect
+- **Input Requirements**:
+  - Batch of images in ComfyUI format (batch, height, width, channels)
+- **Output**:
+  - Resampled image sequence with target frame count
+  - Frame count as integer for downstream processing
+- **Use Cases**:
+  - Creating slow motion effects (50 frames → 75 frames)
+  - Speeding up sequences (50 frames → 25 frames)
+  - Standardizing frame counts across different clips
+  - Temporal upsampling with smooth interpolation
+
 ## Raft Optical Flow Node
 
 > Note: The following node is for the use of [TemporalNet2](https://huggingface.co/CiaraRowles/TemporalNet2) in video streaming workflows
