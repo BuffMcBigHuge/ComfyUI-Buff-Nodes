@@ -4,7 +4,10 @@ Created by: https://github.com/BuffMcBigHuge
 '''
 
 import os
+import io
+import re
 import random
+import glob as glob_module
 import folder_paths
 import json
 import time
@@ -791,6 +794,118 @@ class FrameRateModulator:
         return (resampled_images, output_frame_count)
 
 
+class MultilineTextSplitter:
+    """Splits multiline text into multiple outputs based on specified parameters."""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_text": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Multiline text input to split into multiple outputs"
+                }),
+                "num_outputs": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 20,
+                    "tooltip": "Number of output text fields to create"
+                }),
+                "lines_per_output": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 1000,
+                    "tooltip": "Number of lines per output (used when split_evenly is False)"
+                }),
+                "split_evenly": (["True", "False"], {
+                    "default": "False",
+                    "tooltip": "When True, splits lines evenly across outputs. When False, uses lines_per_output for each output sequentially."
+                }),
+            },
+            "optional": {
+                "remove_empty_lines": (["True", "False"], {
+                    "default": "False",
+                    "tooltip": "When True, removes empty lines from the input before processing. When False, empty lines are preserved."
+                }),
+            }
+        }
+    
+    # The num_outputs parameter controls how many outputs contain data
+    # Unused outputs will return empty strings
+    RETURN_TYPES = tuple(["STRING"] * 20)  # Maximum 20 outputs
+    RETURN_NAMES = tuple([f"text_{i+1}" for i in range(20)])  # Return names for all outputs
+    FUNCTION = "split_text"
+    CATEGORY = "utils"
+    
+    def split_text(self, input_text, num_outputs, lines_per_output, split_evenly, remove_empty_lines="False"):
+        """
+        Splits multiline text into multiple outputs.
+        
+        Args:
+            input_text: The multiline text input
+            num_outputs: Number of outputs to create
+            lines_per_output: Lines per output when split_evenly is False
+            split_evenly: Whether to split evenly across outputs
+            remove_empty_lines: Whether to remove empty lines before processing
+        
+        Returns:
+            Tuple of strings, one for each output (up to 20 outputs)
+        """
+        # Split input into lines
+        lines = input_text.split('\n')
+        
+        # Remove empty lines if requested
+        if remove_empty_lines == "True":
+            lines = [line for line in lines if line.strip() != ""]
+        
+        total_lines = len(lines)
+        
+        # Ensure num_outputs doesn't exceed maximum
+        num_outputs = min(num_outputs, 20)
+        
+        # Initialize results list with empty strings for all possible outputs
+        results = [""] * 20
+        
+        if total_lines == 0:
+            # Return empty strings for all outputs
+            return tuple(results)
+        
+        if split_evenly == "True":
+            # Split evenly across outputs
+            if num_outputs == 0:
+                return tuple(results)
+            
+            # Calculate how many lines each output should get
+            lines_per_output_actual = total_lines // num_outputs
+            remainder = total_lines % num_outputs
+            
+            start_idx = 0
+            for i in range(num_outputs):
+                # Distribute remainder lines across first outputs
+                current_lines = lines_per_output_actual + (1 if i < remainder else 0)
+                end_idx = start_idx + current_lines
+                output_text = '\n'.join(lines[start_idx:end_idx])
+                results[i] = output_text
+                start_idx = end_idx
+        else:
+            # Use lines_per_output for each output sequentially
+            start_idx = 0
+            for i in range(num_outputs):
+                end_idx = start_idx + lines_per_output
+                if start_idx >= total_lines:
+                    # No more lines to process
+                    results[i] = ""
+                else:
+                    # Get lines for this output (up to end_idx or end of lines)
+                    output_lines = lines[start_idx:end_idx]
+                    output_text = '\n'.join(output_lines)
+                    results[i] = output_text
+                start_idx = end_idx
+        
+        return tuple(results)
+
+
 class MostRecentFileSelector:
     """Selects the most recently modified file in a given directory, or creates a black image if none found."""
 
@@ -962,6 +1077,262 @@ class MostRecentFileSelector:
                 return ("",)
 
 
+class LoadTextLineFromFile:
+    """Loads text from a file and returns a specific line by index, random selection, or all lines.
+    
+    Supports .txt and .csv files, with options for filtering comments, blank lines,
+    tag removal, weighting, and text transformations.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file_path": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Path to a text file (.txt, .csv, etc.) or a directory. "
+                               "When a directory is given, a random .txt file is selected from it. "
+                               "Surrounding quotes are stripped automatically."
+                }),
+                "selection_mode": (["random", "index", "all", "sequential"], {
+                    "default": "random",
+                    "tooltip": (
+                        "random: Pick a random line (seeded).\n"
+                        "index: Pick a specific line by index number.\n"
+                        "all: Return every line joined by the join_delimiter.\n"
+                        "sequential: Cycle through lines in order across executions."
+                    )
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Seed for random selection. Same seed + same file = same line."
+                }),
+                "index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Line index to retrieve when selection_mode is 'index'. Wraps around if out of range."
+                }),
+            },
+            "optional": {
+                "text_override": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "When connected, this text is used instead of reading from file_path. "
+                               "All line selection and filtering still applies."
+                }),
+                "skip_comments": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip lines starting with '#' (after stripping whitespace)."
+                }),
+                "skip_blank_lines": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip empty or whitespace-only lines."
+                }),
+                "strip_whitespace": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Strip leading/trailing whitespace from each line."
+                }),
+                "replace_underscores": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Replace underscores with spaces in the output text."
+                }),
+                "ban_tags": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Comma-separated list of tags/words to remove from the output. "
+                               "Surrounding commas and extra spaces are cleaned up."
+                }),
+                "prefix": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Text to prepend to the output."
+                }),
+                "suffix": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Text to append to the output."
+                }),
+                "weight": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -10.0,
+                    "max": 10.0,
+                    "step": 0.01,
+                    "tooltip": "When non-zero, wraps output as (text:weight) for prompt weighting."
+                }),
+                "join_delimiter": ("STRING", {
+                    "default": ", ",
+                    "tooltip": "Delimiter used to join lines when selection_mode is 'all'."
+                }),
+                "encoding": (["utf-8", "utf-8-sig", "latin-1", "ascii", "cp1252"], {
+                    "default": "utf-8",
+                    "tooltip": "File encoding to use when reading the text file."
+                }),
+                "pick_random_file_from_dir": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When True and file_path is a directory, pick a random .txt file from it."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("text", "source_file", "line_count")
+    FUNCTION = "load_text_line"
+    CATEGORY = "utils"
+
+    _sequential_indices = {}
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        if kwargs.get("selection_mode") == "sequential":
+            return float("nan")
+        return ""
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Strip quotes, whitespace, and normalize separators."""
+        path = path.strip().strip('"\'').strip()
+        path = os.path.normpath(path)
+        return path
+
+    @staticmethod
+    def _read_lines(file_path: str, encoding: str = "utf-8") -> list[str]:
+        """Read a file and return raw lines (newlines stripped)."""
+        with open(file_path, "r", encoding=encoding, newline="") as f:
+            content = f.read()
+        lines = []
+        for line in io.StringIO(content):
+            lines.append(line.rstrip("\n").rstrip("\r"))
+        return lines
+
+    @staticmethod
+    def _filter_lines(lines: list[str], skip_comments: bool, skip_blank: bool, strip_ws: bool) -> list[str]:
+        """Filter and optionally strip lines."""
+        result = []
+        for line in lines:
+            working = line.strip() if strip_ws else line
+            if skip_comments and working.lstrip().startswith("#"):
+                continue
+            if skip_blank and working.strip() == "":
+                continue
+            result.append(working)
+        return result
+
+    @staticmethod
+    def _remove_tags(text: str, ban_tags: str) -> str:
+        """Remove comma-separated tags from text and clean up leftover delimiters."""
+        if not ban_tags.strip():
+            return text
+        tags = [t.strip() for t in ban_tags.split(",") if t.strip()]
+        for tag in tags:
+            text = re.sub(
+                r",?\s*" + re.escape(tag) + r"\s*,?",
+                ",",
+                text,
+            )
+        text = re.sub(r",\s*,", ",", text)
+        text = text.strip(", ")
+        return text
+
+    def load_text_line(
+        self,
+        file_path: str = "",
+        selection_mode: str = "random",
+        seed: int = 0,
+        index: int = 0,
+        text_override: str | None = None,
+        skip_comments: bool = True,
+        skip_blank_lines: bool = True,
+        strip_whitespace: bool = True,
+        replace_underscores: bool = False,
+        ban_tags: str = "",
+        prefix: str = "",
+        suffix: str = "",
+        weight: float = 0.0,
+        join_delimiter: str = ", ",
+        encoding: str = "utf-8",
+        pick_random_file_from_dir: bool = False,
+    ):
+        source_file = ""
+
+        if text_override is not None:
+            raw_lines = text_override.split("\n")
+            source_file = "<text_override>"
+        else:
+            file_path = self._normalize_path(file_path)
+
+            if not file_path:
+                print("[LoadTextLineFromFile] No file path provided.")
+                return ("", "", 0)
+
+            if os.path.isdir(file_path):
+                if not pick_random_file_from_dir:
+                    print(f"[LoadTextLineFromFile] Path is a directory but pick_random_file_from_dir is off: {file_path}")
+                    return ("", file_path, 0)
+
+                txt_files = glob_module.glob(os.path.join(file_path, "**", "*.txt"), recursive=True)
+                if not txt_files:
+                    print(f"[LoadTextLineFromFile] No .txt files found in directory: {file_path}")
+                    return ("", file_path, 0)
+
+                rng = random.Random(seed)
+                file_path = rng.choice(txt_files)
+
+            if not os.path.isfile(file_path):
+                print(f"[LoadTextLineFromFile] File not found: {file_path}")
+                return ("", file_path, 0)
+
+            source_file = file_path
+
+            try:
+                raw_lines = self._read_lines(file_path, encoding)
+            except Exception as e:
+                print(f"[LoadTextLineFromFile] Error reading file: {e}")
+                return ("", file_path, 0)
+
+        lines = self._filter_lines(raw_lines, skip_comments, skip_blank_lines, strip_whitespace)
+        line_count = len(lines)
+
+        if line_count == 0:
+            print(f"[LoadTextLineFromFile] No lines remaining after filtering ({source_file}).")
+            return ("", source_file, 0)
+
+        if selection_mode == "random":
+            rng = random.Random(seed)
+            output = rng.choice(lines)
+        elif selection_mode == "index":
+            output = lines[index % line_count]
+        elif selection_mode == "sequential":
+            cache_key = source_file or file_path
+            idx = self._sequential_indices.get(cache_key, 0)
+            output = lines[idx % line_count]
+            self._sequential_indices[cache_key] = (idx + 1) % line_count
+        else:  # all
+            output = join_delimiter.join(lines)
+
+        if replace_underscores:
+            output = output.replace("_", " ")
+
+        output = self._remove_tags(output, ban_tags)
+
+        if isinstance(weight, str):
+            try:
+                weight = float(weight) if weight else 0.0
+            except ValueError:
+                weight = 0.0
+        if weight != 0.0:
+            output = f"({output}:{weight})"
+
+        if prefix:
+            output = prefix + output
+        if suffix:
+            output = output + suffix
+
+        return (output, source_file, line_count)
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -969,7 +1340,9 @@ NODE_CLASS_MAPPINGS = {
     "ConsoleOutput": ConsoleOutput,
     "TwoImageConcatenator": TwoImageConcatenator,
     "RaftOpticalFlowNode": RaftOpticalFlowNode,
-    "MostRecentFileSelector": MostRecentFileSelector
+    "MostRecentFileSelector": MostRecentFileSelector,
+    "MultilineTextSplitter": MultilineTextSplitter,
+    "LoadTextLineFromFile": LoadTextLineFromFile
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -978,5 +1351,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ConsoleOutput": "Console Output (Buff)",
     "TwoImageConcatenator": "Two Image Concatenator (Buff)",
     "RaftOpticalFlowNode": "Raft Optical Flow Node (Buff)",
-    "MostRecentFileSelector": "Most Recent File Selector (Buff)"
+    "MostRecentFileSelector": "Most Recent File Selector (Buff)",
+    "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
+    "LoadTextLineFromFile": "Load Text Line From File (Buff)"
 }

@@ -2,10 +2,6 @@
 
 Several quality-of-life batch operation and string manipulation nodes.
 
-_WORK IN PROGRESS_
-
-In part written with Claude-3.7-Sonnet in a human in-the-loop development standard.
-
 ## File Path Selector Node
 
 The `FilePathSelectorFromDirectory` node is a utility for ComfyUI that helps you select files from a specified directory. 
@@ -29,6 +25,48 @@ The `StringProcessor` node allows you to manipulate text strings with various op
   - Custom word delimiters
   - Comprehensive tooltips with examples
   - Error handling for custom expressions
+
+## Multiline Text Splitter Node
+
+The `MultilineTextSplitter` node splits multiline text into multiple output fields:
+- **Features**:
+  - Split input text across 1–20 output fields
+  - **Split Modes**:
+    - **Even Split**: Distributes lines evenly across outputs
+    - **Fixed Lines**: Assigns a fixed number of lines per output (configurable via `lines_per_output`)
+  - Optional removal of empty lines before processing
+- **Input Options**:
+  - **Input Text**: Multiline text to split
+  - **Num Outputs**: Number of output fields (1–20)
+  - **Lines Per Output**: Lines per output when not splitting evenly
+  - **Split Evenly**: When True, splits evenly; when False, uses `lines_per_output` sequentially
+  - **Remove Empty Lines**: Optionally strip empty lines before splitting
+- **Output**: Up to 20 text outputs (`text_1` through `text_20`); unused outputs return empty strings
+
+## Load Text Line From File Node
+
+The `LoadTextLineFromFile` node loads text from a file and returns a specific line or all lines:
+- **Features**:
+  - Supports `.txt` and `.csv` files
+  - **Selection Modes**:
+    - **Random**: Pick a random line (seeded for reproducibility)
+    - **Index**: Pick a specific line by index (wraps around if out of range)
+    - **Sequential**: Cycle through lines in order across executions
+    - **All**: Return every line joined by a delimiter
+  - **Text Override**: Optional input to use connected text instead of reading from file (filtering still applies)
+- **Filtering Options**:
+  - Skip lines starting with `#` (comments)
+  - Skip blank lines
+  - Strip leading/trailing whitespace
+  - Replace underscores with spaces
+  - Remove specified tags via comma-separated `ban_tags` list
+- **Output Formatting**:
+  - Prefix and suffix
+  - Prompt weighting: wrap output as `(text:weight)` when weight is non-zero
+  - Custom join delimiter for "all" mode
+- **Directory Support**: When `file_path` is a directory and `pick_random_file_from_dir` is True, selects a random `.txt` file from it
+- **Encoding**: Configurable file encoding (utf-8, utf-8-sig, latin-1, ascii, cp1252)
+- **Output**: Returns `(text, source_file, line_count)`
 
 ## Console Output Node
 
@@ -127,6 +165,9 @@ The `RaftOpticalFlowNode` calculates optical flow between two images using the R
 - Creating workflows that process batches of files in sequence
 - Manipulating text data within workflows (filenames, prompts, metadata)
 - Extracting portions of text from larger strings
+- Splitting multiline prompts or lists across multiple nodes (e.g., batch prompts)
+- Loading prompts, tags, or captions from text files with random or sequential selection
+- Building prompt libraries from .txt or .csv files with filtering and weighting
 - Debugging workflows by logging intermediate values to the console
 - Formatting and transforming text for use in prompts or file operations
 - Processing video frames for motion analysis
