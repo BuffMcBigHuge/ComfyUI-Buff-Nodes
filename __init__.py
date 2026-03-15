@@ -1,4 +1,4 @@
-from .Buff import FilePathSelectorFromDirectory, ConsoleOutput, StringProcessor, TwoImageConcatenator, MostRecentFileSelector, RaftOpticalFlowNode, FrameRateModulator, MultilineTextSplitter, LoadTextLineFromFile
+from .Buff import FilePathSelectorFromDirectory, ConsoleOutput, StringProcessor, TwoImageConcatenator, MostRecentFileSelector, RaftOpticalFlowNode, BatchRaftOpticalFlowNode, FrameRateModulator, MultilineTextSplitter, LoadTextLineFromFile
 
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -7,6 +7,7 @@ NODE_CLASS_MAPPINGS = {
     "TwoImageConcatenator": TwoImageConcatenator,
     "MostRecentFileSelector": MostRecentFileSelector,
     "RaftOpticalFlowNode": RaftOpticalFlowNode,
+    "BatchRaftOpticalFlowNode": BatchRaftOpticalFlowNode,
     "FrameRateModulator": FrameRateModulator,
     "MultilineTextSplitter": MultilineTextSplitter,
     "LoadTextLineFromFile": LoadTextLineFromFile,
@@ -17,6 +18,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ConsoleOutput": "Console Output (Buff)",
     "TwoImageConcatenator": "Two Image Concatenator (Buff)",
     "RaftOpticalFlowNode": "Raft Optical Flow Node (Buff)",
+    "BatchRaftOpticalFlowNode": "Batch Raft Optical Flow Node (Buff)",
     "MostRecentFileSelector": "Most Recent File Selector (Buff)",
     "FrameRateModulator": "Frame Rate Modulator (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",

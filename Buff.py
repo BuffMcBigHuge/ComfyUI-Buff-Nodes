@@ -906,6 +906,110 @@ class MultilineTextSplitter:
         return tuple(results)
 
 
+class BatchRaftOpticalFlowNode:
+    """
+    Computes RAFT optical flow on consecutive pairs from an image batch.
+    Given n images, produces n-1 flow visualizations: (0,1), (1,2), ..., (n-2,n-1).
+    Uses CUDA when available and processes pairs in chunks to avoid OOM.
+    """
+    def __init__(self):
+        self.weights = Raft_Large_Weights.DEFAULT
+        self.model = raft_large(weights=self.weights, progress=True).eval()
+        self.preprocess = self.weights.transforms()
+        self._device = None
+
+    def _get_device(self):
+        if self._device is None:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return self._device
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Batch of images [B, H, W, C]. Optical flow is computed between each consecutive pair."
+                }),
+            },
+            "optional": {
+                "batch_chunk_size": ("INT", {
+                    "default": 4,
+                    "min": 1,
+                    "max": 64,
+                    "tooltip": "Number of pairs to process per GPU batch. Lower values use less VRAM. Increase for speed if you have enough VRAM."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("optical_flow",)
+    FUNCTION = "calculate_batch_flow"
+    CATEGORY = "Image"
+
+    def _pad_to_multiple_of_8(self, height, width):
+        """Return (pad_h, pad_w) needed to make dimensions divisible by 8."""
+        pad_h = (8 - (height % 8)) % 8
+        pad_w = (8 - (width % 8)) % 8
+        return pad_h, pad_w
+
+    def calculate_batch_flow(self, images: torch.Tensor, batch_chunk_size: int = 4):
+        batch_size = images.shape[0]
+        if batch_size < 2:
+            raise ValueError("BatchRaftOpticalFlowNode requires at least 2 images in the batch.")
+
+        device = self._get_device()
+        self.model = self.model.to(device)
+
+        num_pairs = batch_size - 1
+        print(f"BatchRaftOpticalFlowNode: {num_pairs} pair(s), device={device}, chunk_size={batch_chunk_size}")
+
+        _, orig_h, orig_w, _ = images.shape
+        pad_h, pad_w = self._pad_to_multiple_of_8(orig_h, orig_w)
+
+        # [B, H, W, C] -> [B, C, H, W] as float32, all at once on CPU
+        imgs_chw = images.permute(0, 3, 1, 2).contiguous()
+
+        if pad_h > 0 or pad_w > 0:
+            imgs_chw = torch.nn.functional.pad(imgs_chw, (0, pad_w, 0, pad_h), mode='replicate')
+
+        # Build consecutive pair tensors without PIL conversion:
+        # frames_a = [0, 1, ..., n-2], frames_b = [1, 2, ..., n-1]
+        frames_a = imgs_chw[:-1]  # [n-1, C, H, W]
+        frames_b = imgs_chw[1:]   # [n-1, C, H, W]
+
+        flow_vis_list = []
+
+        for chunk_start in range(0, num_pairs, batch_chunk_size):
+            chunk_end = min(chunk_start + batch_chunk_size, num_pairs)
+
+            chunk_a = frames_a[chunk_start:chunk_end].to(device)
+            chunk_b = frames_b[chunk_start:chunk_end].to(device)
+
+            # RAFT preprocess: expects [B,C,H,W] tensors in 0-255 uint8 range or 0-1 float
+            # The transforms() call normalizes and converts — works on tensor batches directly
+            chunk_a_proc, chunk_b_proc = self.preprocess(chunk_a, chunk_b)
+
+            with torch.no_grad():
+                flows = self.model(chunk_a_proc, chunk_b_proc)
+                predicted_flow = flows[-1]  # [chunk, 2, H, W]
+
+            chunk_vis = flow_to_image(predicted_flow.cpu()).float() / 255.0
+            flow_vis_list.append(chunk_vis)
+
+            # Free GPU memory between chunks
+            del chunk_a, chunk_b, chunk_a_proc, chunk_b_proc, flows, predicted_flow
+
+        # Concatenate all chunks: [n-1, 3, H, W]
+        all_flow_vis = torch.cat(flow_vis_list, dim=0)
+
+        # Convert to ComfyUI format [B, H, W, C] and crop padding
+        all_flow_vis = all_flow_vis.permute(0, 2, 3, 1).contiguous()
+        if pad_h > 0 or pad_w > 0:
+            all_flow_vis = all_flow_vis[:, :orig_h, :orig_w, :]
+
+        return (all_flow_vis,)
+
+
 class MostRecentFileSelector:
     """Selects the most recently modified file in a given directory, or creates a black image if none found."""
 
@@ -1340,6 +1444,7 @@ NODE_CLASS_MAPPINGS = {
     "ConsoleOutput": ConsoleOutput,
     "TwoImageConcatenator": TwoImageConcatenator,
     "RaftOpticalFlowNode": RaftOpticalFlowNode,
+    "BatchRaftOpticalFlowNode": BatchRaftOpticalFlowNode,
     "MostRecentFileSelector": MostRecentFileSelector,
     "MultilineTextSplitter": MultilineTextSplitter,
     "LoadTextLineFromFile": LoadTextLineFromFile
@@ -1351,6 +1456,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ConsoleOutput": "Console Output (Buff)",
     "TwoImageConcatenator": "Two Image Concatenator (Buff)",
     "RaftOpticalFlowNode": "Raft Optical Flow Node (Buff)",
+    "BatchRaftOpticalFlowNode": "Batch Raft Optical Flow Node (Buff)",
     "MostRecentFileSelector": "Most Recent File Selector (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
     "LoadTextLineFromFile": "Load Text Line From File (Buff)"
