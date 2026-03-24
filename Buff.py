@@ -1227,21 +1227,9 @@ class LoadTextLineFromFile:
                     "tooltip": "When connected, this text is used instead of reading from file_path. "
                                "All line selection and filtering still applies."
                 }),
-                "skip_comments": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Skip lines starting with '#' (after stripping whitespace)."
-                }),
-                "skip_blank_lines": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Skip empty or whitespace-only lines."
-                }),
-                "strip_whitespace": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Strip leading/trailing whitespace from each line."
-                }),
-                "replace_underscores": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Replace underscores with spaces in the output text."
+                "encoding": (["utf-8", "utf-8-sig", "latin-1", "ascii", "cp1252"], {
+                    "default": "utf-8",
+                    "tooltip": "File encoding to use when reading the text file."
                 }),
                 "ban_tags": ("STRING", {
                     "default": "",
@@ -1259,6 +1247,10 @@ class LoadTextLineFromFile:
                     "multiline": False,
                     "tooltip": "Text to append to the output."
                 }),
+                "join_delimiter": ("STRING", {
+                    "default": ", ",
+                    "tooltip": "Delimiter used to join lines when selection_mode is 'all'."
+                }),
                 "weight": ("FLOAT", {
                     "default": 0.0,
                     "min": -10.0,
@@ -1266,13 +1258,21 @@ class LoadTextLineFromFile:
                     "step": 0.01,
                     "tooltip": "When non-zero, wraps output as (text:weight) for prompt weighting."
                 }),
-                "join_delimiter": ("STRING", {
-                    "default": ", ",
-                    "tooltip": "Delimiter used to join lines when selection_mode is 'all'."
+                "skip_comments": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip lines starting with '#' (after stripping whitespace)."
                 }),
-                "encoding": (["utf-8", "utf-8-sig", "latin-1", "ascii", "cp1252"], {
-                    "default": "utf-8",
-                    "tooltip": "File encoding to use when reading the text file."
+                "skip_blank_lines": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip empty or whitespace-only lines."
+                }),
+                "strip_whitespace": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Strip leading/trailing whitespace from each line."
+                }),
+                "replace_underscores": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Replace underscores with spaces in the output text."
                 }),
                 "pick_random_file_from_dir": ("BOOLEAN", {
                     "default": False,
