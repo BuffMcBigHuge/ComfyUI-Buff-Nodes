@@ -1223,9 +1223,11 @@ class LoadTextLineFromFile:
             },
             "optional": {
                 "text_override": ("STRING", {
-                    "forceInput": True,
-                    "tooltip": "When connected, this text is used instead of reading from file_path. "
-                               "All line selection and filtering still applies."
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "When provided, this text is used instead of reading from file_path. "
+                               "All line selection and filtering still applies. "
+                               "Right-click and Convert to Input to connect a wire instead."
                 }),
                 "encoding": (["utf-8", "utf-8-sig", "latin-1", "ascii", "cp1252"], {
                     "default": "utf-8",
@@ -1346,22 +1348,22 @@ class LoadTextLineFromFile:
         selection_mode: str = "random",
         seed: int = 0,
         index: int = 0,
-        text_override: str | None = None,
+        text_override: str = "",
+        encoding: str = "utf-8",
+        ban_tags: str = "",
+        prefix: str = "",
+        suffix: str = "",
+        join_delimiter: str = ", ",
+        weight: float = 0.0,
         skip_comments: bool = True,
         skip_blank_lines: bool = True,
         strip_whitespace: bool = True,
         replace_underscores: bool = False,
-        ban_tags: str = "",
-        prefix: str = "",
-        suffix: str = "",
-        weight: float = 0.0,
-        join_delimiter: str = ", ",
-        encoding: str = "utf-8",
         pick_random_file_from_dir: bool = False,
     ):
         source_file = ""
 
-        if text_override is not None:
+        if text_override is not None and text_override.strip() != "":
             raw_lines = text_override.split("\n")
             source_file = "<text_override>"
         else:
