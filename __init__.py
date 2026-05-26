@@ -1,4 +1,4 @@
-from .Buff import FilePathSelectorFromDirectory, ConsoleOutput, StringProcessor, TwoImageConcatenator, MostRecentFileSelector, RaftOpticalFlowNode, BatchRaftOpticalFlowNode, FrameRateModulator, MultilineTextSplitter, LoadTextLineFromFile
+from .Buff import FilePathSelectorFromDirectory, ConsoleOutput, StringProcessor, TwoImageConcatenator, MostRecentFileSelector, RaftOpticalFlowNode, BatchRaftOpticalFlowNode, FrameRateModulator, VideoTransitionBatchMerger, MultilineTextSplitter, LoadTextLineFromFile
 
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -9,6 +9,7 @@ NODE_CLASS_MAPPINGS = {
     "RaftOpticalFlowNode": RaftOpticalFlowNode,
     "BatchRaftOpticalFlowNode": BatchRaftOpticalFlowNode,
     "FrameRateModulator": FrameRateModulator,
+    "VideoTransitionBatchMerger": VideoTransitionBatchMerger,
     "MultilineTextSplitter": MultilineTextSplitter,
     "LoadTextLineFromFile": LoadTextLineFromFile,
 }
@@ -21,6 +22,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BatchRaftOpticalFlowNode": "Batch Raft Optical Flow Node (Buff)",
     "MostRecentFileSelector": "Most Recent File Selector (Buff)",
     "FrameRateModulator": "Frame Rate Modulator (Buff)",
+    "VideoTransitionBatchMerger": "Video Transition Batch Merger (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
     "LoadTextLineFromFile": "Load Text Line From File (Buff)",
 }
+
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

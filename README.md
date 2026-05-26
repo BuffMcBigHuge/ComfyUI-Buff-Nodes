@@ -141,6 +141,45 @@ The `FrameRateModulator` node allows you to modify the frame rate of image seque
   - Standardizing frame counts across different clips
   - Temporal upsampling with smooth interpolation
 
+## Video Transition Batch Merger Node
+
+The `VideoTransitionBatchMerger` node merges multiple ComfyUI image batches into a single output timeline with configurable transitions between clips:
+- **Multi-Clip Timeline**:
+  - Connect `image_batch_1` and `image_batch_2` for a standard A/B transition
+  - Connect optional `audio_1` and `audio_2` when clips have audio; ComfyUI `AUDIO`, lazy `AUDIO` from Video Helper Suite `Load Video` nodes, and legacy `VHS_AUDIO` are accepted
+  - Set `inputcount`, then click `Update inputs/transitions` to add or remove `image_batch_3+` and `audio_3+` sockets
+  - The same update button adds or removes `transition_N` and `transition_frames_N` controls for each clip boundary
+  - `transition_plan` stores those dynamic pair controls for the backend and supports manual overrides such as `8:dip_to_white:10`
+- **Audio Timeline**:
+  - `fps` controls the full output duration and audio alignment
+  - Clips without audio produce silence for their portion of the timeline
+  - Non-overlapping inserted transition frames produce silence
+  - Overlapping transitions trim audio to match the shortened video timeline and crossfade the overlapping audio handles
+- **Overlapping A/B Transitions**:
+  - Cross dissolve
+  - Additive / film dissolve
+  - Linear wipes in horizontal, vertical, and diagonal directions
+  - Barn doors open/close
+  - Radial/clock wipe
+  - Iris circle, diamond, and star wipes
+  - Push and slide transitions in all four directions
+- **Non-Overlapping Inserted Transitions**:
+  - Dip to black
+  - Dip to white
+  - Morph-cut style generated in-between frames
+  - Whip pan / swish pan in horizontal or vertical directions
+  - Light leak / flare transition
+- **Timeline Modes**:
+  - `auto`: uses overlap for A/B roll transitions and inserted frames for dip/camera-artifact transitions
+  - `overlap`: consumes handles from the outgoing and incoming clips, so output frames are less than the total input frames
+  - `non_overlap`: inserts generated transition frames between clips, so output frames are greater than or equal to the total input frames
+- **Output**:
+  - Merged image batch
+  - Single aligned audio track
+  - FPS passthrough
+  - Final frame count
+  - Timeline summary string for debugging
+
 ## Raft Optical Flow Node
 
 > Note: The following node is for the use of [TemporalNet2](https://huggingface.co/CiaraRowles/TemporalNet2) in video streaming workflows

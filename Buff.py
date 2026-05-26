@@ -13,7 +13,9 @@ import json
 import time
 import os.path
 import fnmatch
+from collections.abc import Mapping
 import torch
+import torch.nn.functional as torch_nn_func
 import numpy as np
 from PIL import Image
 from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
@@ -1439,6 +1441,897 @@ class LoadTextLineFromFile:
         return (output, source_file, line_count)
 
 
+class VideoTransitionBatchMerger:
+    """Merge image batches into one video timeline with overlapping or inserted transitions."""
+
+    MAX_BATCHES = 64
+
+    TRANSITIONS = [
+        "cut",
+        "cross_dissolve",
+        "additive_dissolve",
+        "linear_wipe_left_to_right",
+        "linear_wipe_right_to_left",
+        "linear_wipe_top_to_bottom",
+        "linear_wipe_bottom_to_top",
+        "linear_wipe_diagonal_tl_br",
+        "linear_wipe_diagonal_tr_bl",
+        "barn_doors_open",
+        "barn_doors_close",
+        "radial_clock_wipe",
+        "iris_circle",
+        "iris_diamond",
+        "iris_star",
+        "push_left",
+        "push_right",
+        "push_up",
+        "push_down",
+        "slide_left",
+        "slide_right",
+        "slide_up",
+        "slide_down",
+        "dip_to_black",
+        "dip_to_white",
+        "morph_cut",
+        "whip_pan_left",
+        "whip_pan_right",
+        "whip_pan_up",
+        "whip_pan_down",
+        "light_leak",
+    ]
+    PAIR_TRANSITIONS = ["same_as_default"] + TRANSITIONS
+    NON_OVERLAP_TRANSITIONS = {
+        "dip_to_black",
+        "dip_to_white",
+        "morph_cut",
+        "whip_pan_left",
+        "whip_pan_right",
+        "whip_pan_up",
+        "whip_pan_down",
+        "light_leak",
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        required = {
+            "inputcount": ("INT", {
+                "default": 2,
+                "min": 2,
+                "max": cls.MAX_BATCHES,
+                "step": 1,
+                "tooltip": "Set the number of image batch inputs, then click Update inputs on the node."
+            }),
+            "image_batch_1": ("IMAGE", {
+                "tooltip": "First clip as a ComfyUI IMAGE batch [frames, height, width, channels]."
+            }),
+            "image_batch_2": ("IMAGE", {
+                "tooltip": "Second clip as a ComfyUI IMAGE batch [frames, height, width, channels]."
+            }),
+            "fps": ("FLOAT", {
+                "default": 24.0,
+                "min": 1.0,
+                "max": 240.0,
+                "step": 0.01,
+                "tooltip": "Frames per second for the merged image timeline and audio alignment."
+            }),
+            "transition_mode": (["auto", "overlap", "non_overlap"], {
+                "default": "auto",
+                "tooltip": "auto: overlap for A/B roll transitions and non-overlap for dip/camera-artifact transitions."
+            }),
+            "default_transition": (cls.TRANSITIONS, {
+                "default": "cross_dissolve",
+                "tooltip": "Transition used when a pair-specific transition is set to same_as_default."
+            }),
+            "default_transition_frames": ("INT", {
+                "default": 12,
+                "min": 0,
+                "max": 1000,
+                "step": 1,
+                "tooltip": "Default transition length in frames. Pair-specific values of 0 use this default."
+            }),
+            "easing": (["linear", "ease_in", "ease_out", "ease_in_out", "smoothstep"], {
+                "default": "smoothstep",
+                "tooltip": "Progress curve used by opacity, wipe, slide, and inserted transition frames."
+            }),
+            "size_match": (["strict", "first_batch", "largest_area", "smallest_area"], {
+                "default": "first_batch",
+                "tooltip": "How to choose the output dimensions when input batches differ."
+            }),
+            "resize_method": (["stretch", "pad", "crop"], {
+                "default": "pad",
+                "tooltip": "Resize method used when size_match is not strict and clip dimensions differ."
+            }),
+            "wipe_softness": ("FLOAT", {
+                "default": 0.08,
+                "min": 0.0,
+                "max": 0.5,
+                "step": 0.01,
+                "tooltip": "Soft edge width for wipe and iris transitions as a fraction of the frame."
+            }),
+            "effect_intensity": ("FLOAT", {
+                "default": 1.0,
+                "min": 0.0,
+                "max": 3.0,
+                "step": 0.05,
+                "tooltip": "Strength for bloom, light leak, and whip-pan blur effects."
+            }),
+        }
+
+        optional = {
+            "audio_1": ("AUDIO,VHS_AUDIO", {
+                "tooltip": "Optional audio paired with image_batch_1. Accepts ComfyUI AUDIO or legacy VHS_AUDIO."
+            }),
+            "audio_2": ("AUDIO,VHS_AUDIO", {
+                "tooltip": "Optional audio paired with image_batch_2. Accepts ComfyUI AUDIO or legacy VHS_AUDIO."
+            }),
+            "transition_plan": ("STRING", {
+                "default": "",
+                "multiline": True,
+                "tooltip": (
+                    "Optional per-pair overrides, one per line. Examples:\n"
+                    "1:cross_dissolve:12\n"
+                    "2:dip_to_white:8\n"
+                    "The web UI manages this automatically when using dynamic transition controls."
+                )
+            })
+        }
+
+        return {"required": required, "optional": optional}
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "STRING")
+    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "timeline_info")
+    FUNCTION = "merge_transitions"
+    CATEGORY = "Image/Animation"
+
+    @staticmethod
+    def _validate_batch(images, name):
+        if images is None:
+            raise ValueError(f"{name} is required.")
+        if not isinstance(images, torch.Tensor):
+            raise ValueError(f"{name} must be a torch.Tensor IMAGE batch.")
+        if images.ndim != 4:
+            raise ValueError(f"{name} must have shape [frames, height, width, channels], got {tuple(images.shape)}.")
+        if images.shape[0] < 1:
+            raise ValueError(f"{name} must contain at least one frame.")
+        if images.shape[-1] < 1:
+            raise ValueError(f"{name} must contain at least one channel.")
+        return images
+
+    @staticmethod
+    def _apply_easing(t, easing):
+        t = t.clamp(0.0, 1.0)
+        if easing == "linear":
+            return t
+        if easing == "ease_in":
+            return t * t
+        if easing == "ease_out":
+            inv = 1.0 - t
+            return 1.0 - inv * inv
+        if easing == "ease_in_out":
+            return torch.where(t < 0.5, 2.0 * t * t, 1.0 - torch.pow(-2.0 * t + 2.0, 2.0) / 2.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    def _progress(self, frame_count, device, dtype, easing):
+        if frame_count <= 0:
+            return torch.empty((0, 1, 1, 1), device=device, dtype=dtype)
+        values = torch.linspace(0.0, 1.0, frame_count + 2, device=device, dtype=dtype)[1:-1]
+        return self._apply_easing(values.view(frame_count, 1, 1, 1), easing)
+
+    @staticmethod
+    def _mix(a, b, alpha):
+        return a * (1.0 - alpha) + b * alpha
+
+    @staticmethod
+    def _target_size(batches, size_match):
+        sizes = [(int(batch.shape[1]), int(batch.shape[2])) for batch in batches]
+        if size_match == "strict":
+            if len(set(sizes)) != 1:
+                raise ValueError(f"All image batches must have the same height/width in strict mode, got {sizes}.")
+            return sizes[0]
+        if size_match == "largest_area":
+            return max(sizes, key=lambda size: size[0] * size[1])
+        if size_match == "smallest_area":
+            return min(sizes, key=lambda size: size[0] * size[1])
+        return sizes[0]
+
+    @staticmethod
+    def _resize_batch(images, target_h, target_w, resize_method):
+        if int(images.shape[1]) == target_h and int(images.shape[2]) == target_w:
+            return images
+
+        n, h, w, c = images.shape
+        nchw = images.permute(0, 3, 1, 2)
+
+        if resize_method == "stretch":
+            resized = torch_nn_func.interpolate(nchw, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            return resized.permute(0, 2, 3, 1).contiguous()
+
+        if resize_method == "crop":
+            scale = max(target_w / float(w), target_h / float(h))
+            new_w = max(target_w, int(np.ceil(w * scale)))
+            new_h = max(target_h, int(np.ceil(h * scale)))
+            resized = torch_nn_func.interpolate(nchw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+            top = max(0, (new_h - target_h) // 2)
+            left = max(0, (new_w - target_w) // 2)
+            resized = resized[:, :, top:top + target_h, left:left + target_w]
+            return resized.permute(0, 2, 3, 1).contiguous()
+
+        scale = min(target_w / float(w), target_h / float(h))
+        new_w = max(1, min(target_w, int(round(w * scale))))
+        new_h = max(1, min(target_h, int(round(h * scale))))
+        resized = torch_nn_func.interpolate(nchw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        pad_left = (target_w - new_w) // 2
+        pad_right = target_w - new_w - pad_left
+        pad_top = (target_h - new_h) // 2
+        pad_bottom = target_h - new_h - pad_top
+        resized = torch_nn_func.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+        return resized.permute(0, 2, 3, 1).contiguous()
+
+    def _prepare_batches(self, batches, size_match, resize_method):
+        channels = int(batches[0].shape[-1])
+        target_h, target_w = self._target_size(batches, size_match)
+        device = batches[0].device
+        dtype = batches[0].dtype
+
+        prepared = []
+        for index, batch in enumerate(batches, start=1):
+            if int(batch.shape[-1]) != channels:
+                raise ValueError(
+                    f"All image batches must have the same channel count. "
+                    f"image_batch_1 has {channels}, image_batch_{index} has {int(batch.shape[-1])}."
+                )
+            batch = batch.to(device=device, dtype=dtype)
+            if size_match != "strict":
+                batch = self._resize_batch(batch, target_h, target_w, resize_method)
+            prepared.append(batch.contiguous())
+        return prepared
+
+    @staticmethod
+    def _frame_to_sample(frame_count, fps, sample_rate):
+        return int(round(float(frame_count) / float(fps) * int(sample_rate)))
+
+    @staticmethod
+    def _resize_audio_samples(waveform, target_samples):
+        target_samples = max(0, int(target_samples))
+        if waveform.shape[-1] == target_samples:
+            return waveform
+        if target_samples == 0:
+            return waveform[..., :0]
+        if waveform.shape[-1] == 0:
+            shape = list(waveform.shape)
+            shape[-1] = target_samples
+            return torch.zeros(shape, dtype=waveform.dtype, device=waveform.device)
+        return torch_nn_func.interpolate(waveform, size=target_samples, mode="linear", align_corners=False)
+
+    def _coerce_audio_input(self, audio, name="audio"):
+        if audio is None:
+            return audio
+        if isinstance(audio, Mapping):
+            if "waveform" in audio and "sample_rate" in audio:
+                return {"waveform": audio["waveform"], "sample_rate": audio["sample_rate"]}
+            return audio
+        if callable(audio):
+            return self._decode_vhs_audio(audio, name)
+        raise ValueError(f"{name} must be ComfyUI AUDIO, dict-like AUDIO, or legacy VHS_AUDIO.")
+
+    def _decode_vhs_audio(self, vhs_audio, name):
+        try:
+            payload = vhs_audio()
+        except Exception as error:
+            raise ValueError(f"{name} VHS_AUDIO callable failed: {error}") from error
+
+        if not payload:
+            raise ValueError(f"{name} VHS_AUDIO input is empty.")
+
+        try:
+            import subprocess
+            from videohelpersuite.utils import ENCODE_ARGS, ffmpeg_path
+
+            result = subprocess.run(
+                [ffmpeg_path, "-i", "-", "-f", "f32le", "-"],
+                input=payload,
+                capture_output=True,
+                check=True,
+            )
+            waveform = torch.frombuffer(bytearray(result.stdout), dtype=torch.float32)
+            stderr = result.stderr.decode(*ENCODE_ARGS)
+        except Exception as ffmpeg_error:
+            try:
+                import av
+
+                frames = []
+                with av.open(io.BytesIO(payload), mode="r") as container:
+                    if not container.streams.audio:
+                        raise ValueError("VHS_AUDIO payload has no audio stream.")
+                    stream = container.streams.audio[0]
+                    sample_rate = int(stream.rate or 44100)
+                    resampler = av.AudioResampler(format="fltp", layout="stereo", rate=sample_rate)
+                    for frame in container.decode(stream):
+                        resampled_frames = resampler.resample(frame) or []
+                        for resampled in resampled_frames:
+                            frames.append(torch.from_numpy(resampled.to_ndarray()))
+                    flushed_frames = resampler.resample(None) or []
+                    for resampled in flushed_frames:
+                        frames.append(torch.from_numpy(resampled.to_ndarray()))
+
+                if not frames:
+                    raise ValueError("VHS_AUDIO payload decoded to zero audio frames.")
+                waveform = torch.cat(frames, dim=1).unsqueeze(0).to(dtype=torch.float32)
+                return {"waveform": waveform, "sample_rate": sample_rate}
+            except Exception as pyav_error:
+                raise ValueError(
+                    f"{name} VHS_AUDIO could not be decoded. "
+                    f"ffmpeg error: {ffmpeg_error}; PyAV error: {pyav_error}"
+                ) from pyav_error
+
+        match = re.search(r", (\d+) Hz, (\w+), ", stderr)
+        if match:
+            sample_rate = int(match.group(1))
+            channel_layout = match.group(2)
+            channels = {"mono": 1, "stereo": 2}.get(channel_layout)
+            if channels is None:
+                raise ValueError(f"{name} VHS_AUDIO channel layout is not supported: {channel_layout}.")
+        else:
+            sample_rate = 44100
+            channels = 2
+
+        if waveform.numel() % channels != 0:
+            waveform = waveform[: waveform.numel() - (waveform.numel() % channels)]
+        waveform = waveform.reshape((-1, channels)).transpose(0, 1).unsqueeze(0)
+        return {"waveform": waveform, "sample_rate": sample_rate}
+
+    def _normalize_audio_waveform(self, audio, sample_rate, target_channels=2, target_samples=None):
+        audio = self._coerce_audio_input(audio)
+        if audio is None:
+            if target_samples is None:
+                target_samples = 0
+            return torch.zeros((1, target_channels, target_samples), dtype=torch.float32)
+
+        if not isinstance(audio, Mapping) or "waveform" not in audio or "sample_rate" not in audio:
+            raise ValueError("Audio inputs must use ComfyUI AUDIO, dict-like AUDIO, or legacy VHS_AUDIO.")
+
+        waveform = audio["waveform"]
+        if not isinstance(waveform, torch.Tensor):
+            raise ValueError("Audio waveform must be a torch.Tensor.")
+        if waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)
+        if waveform.ndim != 3:
+            raise ValueError(f"Audio waveform must have shape [batch, channels, samples], got {tuple(waveform.shape)}.")
+        if waveform.shape[0] > 1:
+            print("[VideoTransitionBatchMerger] Audio batch dimension > 1; using the first audio item.")
+            waveform = waveform[:1]
+
+        waveform = waveform.to(dtype=torch.float32)
+        input_sample_rate = int(audio["sample_rate"])
+        if input_sample_rate <= 0:
+            raise ValueError("Audio sample_rate must be greater than 0.")
+
+        if waveform.shape[1] == 1 and target_channels == 2:
+            waveform = waveform.repeat(1, 2, 1)
+        elif waveform.shape[1] > target_channels:
+            waveform = waveform[:, :target_channels, :]
+        elif waveform.shape[1] < target_channels:
+            repeat_count = int(np.ceil(target_channels / waveform.shape[1]))
+            waveform = waveform.repeat(1, repeat_count, 1)[:, :target_channels, :]
+
+        if input_sample_rate != sample_rate:
+            target_resampled = self._frame_to_sample(waveform.shape[-1], input_sample_rate, sample_rate)
+            waveform = self._resize_audio_samples(waveform, target_resampled)
+
+        if target_samples is not None:
+            waveform = self._resize_audio_samples(waveform, target_samples)
+
+        return waveform
+
+    def _choose_audio_sample_rate(self, audios, default_sample_rate=44100):
+        for audio in audios:
+            if audio is not None and isinstance(audio, dict) and "sample_rate" in audio:
+                sample_rate = int(audio["sample_rate"])
+                if sample_rate > 0:
+                    return sample_rate
+        return int(default_sample_rate)
+
+    def _prepare_audio_clips(self, audios, frame_counts, fps, sample_rate):
+        clips = []
+        target_channels = 2
+        for audio, frame_count in zip(audios, frame_counts):
+            target_samples = self._frame_to_sample(frame_count, fps, sample_rate)
+            if audio is None:
+                clips.append(torch.zeros((1, target_channels, target_samples), dtype=torch.float32))
+            else:
+                clips.append(self._normalize_audio_waveform(audio, sample_rate, target_channels, target_samples))
+        return clips
+
+    def _audio_slice_for_frames(self, waveform, start_frame, end_frame, fps, sample_rate):
+        start_sample = self._frame_to_sample(start_frame, fps, sample_rate)
+        end_sample = self._frame_to_sample(end_frame, fps, sample_rate)
+        return waveform[..., start_sample:end_sample]
+
+    def _silence_for_frames(self, frame_count, reference_audio, fps, sample_rate):
+        samples = self._frame_to_sample(frame_count, fps, sample_rate)
+        return torch.zeros(
+            (1, reference_audio.shape[1], samples),
+            dtype=reference_audio.dtype,
+            device=reference_audio.device,
+        )
+
+    def _fit_audio_to_frames(self, waveform, frame_count, fps, sample_rate):
+        target_samples = self._frame_to_sample(frame_count, fps, sample_rate)
+        return self._resize_audio_samples(waveform, target_samples)
+
+    def _mix_overlap_audio(self, outgoing, incoming, easing):
+        target_samples = max(outgoing.shape[-1], incoming.shape[-1])
+        outgoing = self._resize_audio_samples(outgoing, target_samples)
+        incoming = self._resize_audio_samples(incoming, target_samples)
+        if target_samples == 0:
+            return outgoing
+
+        progress = torch.linspace(
+            0.0,
+            1.0,
+            target_samples + 2,
+            device=outgoing.device,
+            dtype=outgoing.dtype,
+        )[1:-1].view(1, 1, target_samples)
+        progress = self._apply_easing(progress, easing)
+        mixed = outgoing * (1.0 - progress) + incoming * progress
+        return mixed.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _soft_reveal_less(field, threshold, softness):
+        if softness <= 0.0:
+            return (field <= threshold).to(field.dtype)
+        return ((threshold - field) / softness + 0.5).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _soft_reveal_greater(field, threshold, softness):
+        if softness <= 0.0:
+            return (field >= threshold).to(field.dtype)
+        return ((field - threshold) / softness + 0.5).clamp(0.0, 1.0)
+
+    def _render_wipe(self, a, b, transition, progress, wipe_softness):
+        n, h, w, _ = a.shape
+        device = a.device
+        dtype = a.dtype
+        xs = torch.linspace(0.0, 1.0, w, device=device, dtype=dtype).view(1, 1, w, 1)
+        ys = torch.linspace(0.0, 1.0, h, device=device, dtype=dtype).view(1, h, 1, 1)
+        p = progress
+        softness = max(0.0, float(wipe_softness))
+
+        if transition == "linear_wipe_left_to_right":
+            field = xs
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "linear_wipe_right_to_left":
+            field = 1.0 - xs
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "linear_wipe_top_to_bottom":
+            field = ys
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "linear_wipe_bottom_to_top":
+            field = 1.0 - ys
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "linear_wipe_diagonal_tl_br":
+            field = (xs + ys) * 0.5
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "linear_wipe_diagonal_tr_bl":
+            field = ((1.0 - xs) + ys) * 0.5
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "barn_doors_open":
+            field = torch.abs(xs - 0.5) * 2.0
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "barn_doors_close":
+            field = torch.abs(xs - 0.5) * 2.0
+            mask = self._soft_reveal_greater(field, 1.0 - p, softness)
+        elif transition == "radial_clock_wipe":
+            angle = torch.atan2(ys - 0.5, xs - 0.5) + (np.pi / 2.0)
+            field = torch.remainder(angle, 2.0 * np.pi) / (2.0 * np.pi)
+            mask = self._soft_reveal_less(field, p, max(softness * 0.5, 0.0001))
+        elif transition == "iris_circle":
+            field = torch.sqrt(torch.pow(xs - 0.5, 2.0) + torch.pow(ys - 0.5, 2.0)) / np.sqrt(0.5)
+            mask = self._soft_reveal_less(field, p, softness)
+        elif transition == "iris_diamond":
+            field = torch.abs(xs - 0.5) + torch.abs(ys - 0.5)
+            mask = self._soft_reveal_less(field, p, softness)
+        else:
+            dx = xs - 0.5
+            dy = ys - 0.5
+            radius = torch.sqrt(dx * dx + dy * dy) / np.sqrt(0.5)
+            angle = torch.atan2(dy, dx)
+            star_edge = 0.58 + 0.30 * torch.cos(5.0 * angle)
+            field = radius / star_edge.clamp(min=0.08)
+            mask = self._soft_reveal_less(field, p * 1.35, softness)
+
+        if mask.shape[0] == 1 and n > 1:
+            mask = mask.expand(n, -1, -1, -1)
+        return a * (1.0 - mask) + b * mask
+
+    @staticmethod
+    def _shift_frame(frame, dx, dy):
+        h, w, _ = frame.shape
+        dx = int(dx)
+        dy = int(dy)
+        out = torch.zeros_like(frame)
+
+        src_x0 = max(0, -dx)
+        src_x1 = min(w, w - dx)
+        dst_x0 = max(0, dx)
+        dst_x1 = min(w, w + dx)
+
+        src_y0 = max(0, -dy)
+        src_y1 = min(h, h - dy)
+        dst_y0 = max(0, dy)
+        dst_y1 = min(h, h + dy)
+
+        if src_x1 <= src_x0 or src_y1 <= src_y0:
+            return out
+
+        out[dst_y0:dst_y1, dst_x0:dst_x1, :] = frame[src_y0:src_y1, src_x0:src_x1, :]
+        return out
+
+    @staticmethod
+    def _offsets(direction, progress_value, height, width):
+        if direction == "left":
+            return -round(progress_value * width), 0, round((1.0 - progress_value) * width), 0
+        if direction == "right":
+            return round(progress_value * width), 0, -round((1.0 - progress_value) * width), 0
+        if direction == "up":
+            return 0, -round(progress_value * height), 0, round((1.0 - progress_value) * height)
+        return 0, round(progress_value * height), 0, -round((1.0 - progress_value) * height)
+
+    def _render_slide_push(self, a, b, transition, progress):
+        n, h, w, c = a.shape
+        direction = transition.split("_", 1)[1]
+        is_push = transition.startswith("push_")
+        frames = []
+        base_mask = torch.ones((h, w, 1), device=a.device, dtype=a.dtype)
+
+        for index in range(n):
+            p = float(progress[index].reshape(-1)[0].item())
+            ax, ay, bx, by = self._offsets(direction, p, h, w)
+            shifted_b = self._shift_frame(b[index], bx, by)
+            shifted_b_mask = self._shift_frame(base_mask, bx, by)
+
+            if is_push:
+                shifted_a = self._shift_frame(a[index], ax, ay)
+                frame = shifted_a * (1.0 - shifted_b_mask) + shifted_b
+            else:
+                frame = a[index] * (1.0 - shifted_b_mask) + shifted_b
+            frames.append(frame.clamp(0.0, 1.0))
+
+        return torch.stack(frames, dim=0)
+
+    def _render_additive(self, a, b, progress, effect_intensity):
+        base = self._mix(a, b, progress)
+        peak = 4.0 * progress * (1.0 - progress)
+        effect = max(0.0, float(effect_intensity))
+        out = base + torch.clamp(a + b, 0.0, 1.0) * peak * 0.35 * effect + peak * 0.25 * effect
+        return out.clamp(0.0, 1.0)
+
+    def _render_dip(self, a, b, transition, progress):
+        color_value = 1.0 if transition == "dip_to_white" else 0.0
+        color = torch.full_like(a, color_value)
+        first_half = progress < 0.5
+        fade_out = self._mix(a, color, progress * 2.0)
+        fade_in = self._mix(color, b, (progress - 0.5) * 2.0)
+        return torch.where(first_half, fade_out, fade_in).clamp(0.0, 1.0)
+
+    def _render_morph_cut(self, a, b, progress, effect_intensity):
+        smooth = self._apply_easing(progress, "smoothstep")
+        base = self._mix(a, b, smooth)
+        detail_soften = 4.0 * smooth * (1.0 - smooth) * min(max(float(effect_intensity), 0.0), 3.0) * 0.04
+        return (base + (b - a).abs() * detail_soften).clamp(0.0, 1.0)
+
+    def _directional_blur_frame(self, frame, axis, radius):
+        radius = int(max(0, min(radius, 64)))
+        if radius == 0:
+            return frame
+        sample_count = min(radius * 2 + 1, 17)
+        offsets = sorted({int(round(v)) for v in np.linspace(-radius, radius, sample_count)})
+        acc = torch.zeros_like(frame)
+        for offset in offsets:
+            dx = offset if axis == "horizontal" else 0
+            dy = offset if axis == "vertical" else 0
+            acc = acc + self._shift_frame(frame, dx, dy)
+        return acc / float(len(offsets))
+
+    def _render_whip_pan(self, a, b, transition, progress, effect_intensity):
+        direction = transition.replace("whip_pan_", "")
+        pushed = self._render_slide_push(a, b, f"push_{direction}", progress)
+        axis = "horizontal" if direction in {"left", "right"} else "vertical"
+        frames = []
+        for index in range(pushed.shape[0]):
+            p = float(progress[index].reshape(-1)[0].item())
+            peak = max(0.0, float(np.sin(np.pi * p)))
+            radius = int(round((4.0 + 20.0 * max(0.0, float(effect_intensity))) * peak))
+            frames.append(self._directional_blur_frame(pushed[index], axis, radius).clamp(0.0, 1.0))
+        return torch.stack(frames, dim=0)
+
+    def _render_light_leak(self, a, b, progress, effect_intensity):
+        n, h, w, c = a.shape
+        device = a.device
+        dtype = a.dtype
+        base = self._mix(a, b, progress)
+        xs = torch.linspace(0.0, 1.0, w, device=device, dtype=dtype).view(1, 1, w, 1)
+        ys = torch.linspace(0.0, 1.0, h, device=device, dtype=dtype).view(1, h, 1, 1)
+        peak = torch.sin(progress * np.pi).clamp(0.0, 1.0)
+        center_x = 0.15 + progress * 0.70
+        center_y = 0.50 + 0.18 * torch.sin(progress * np.pi * 2.0)
+        dist = torch.pow(xs - center_x, 2.0) + torch.pow(ys - center_y, 2.0)
+        flare = (torch.exp(-dist / 0.035) + 0.35) * peak * max(0.0, float(effect_intensity))
+        color = torch.ones((1, 1, 1, c), device=device, dtype=dtype)
+        if c >= 3:
+            color[..., 0] = 1.0
+            color[..., 1] = 0.72
+            color[..., 2] = 0.28
+        white_peak = torch.pow(peak, 4.0) * 0.40 * min(max(float(effect_intensity), 0.0), 3.0)
+        return (base + flare * color + white_peak).clamp(0.0, 1.0)
+
+    def _render_transition(self, a, b, transition, progress, wipe_softness, effect_intensity):
+        if transition == "cross_dissolve":
+            return self._mix(a, b, progress)
+        if transition == "additive_dissolve":
+            return self._render_additive(a, b, progress, effect_intensity)
+        if transition.startswith("linear_wipe_") or transition.startswith("barn_doors_") or transition.startswith("iris_") or transition == "radial_clock_wipe":
+            return self._render_wipe(a, b, transition, progress, wipe_softness)
+        if transition.startswith("push_") or transition.startswith("slide_"):
+            return self._render_slide_push(a, b, transition, progress)
+        if transition in {"dip_to_black", "dip_to_white"}:
+            return self._render_dip(a, b, transition, progress)
+        if transition == "morph_cut":
+            return self._render_morph_cut(a, b, progress, effect_intensity)
+        if transition.startswith("whip_pan_"):
+            return self._render_whip_pan(a, b, transition, progress, effect_intensity)
+        if transition == "light_leak":
+            return self._render_light_leak(a, b, progress, effect_intensity)
+        return b
+
+    def _mode_for_transition(self, transition, transition_mode):
+        if transition_mode in {"overlap", "non_overlap"}:
+            return transition_mode
+        return "non_overlap" if transition in self.NON_OVERLAP_TRANSITIONS else "overlap"
+
+    def _parse_transition_plan(self, transition_plan):
+        plan = {}
+        if not transition_plan or not str(transition_plan).strip():
+            return plan
+
+        entries = re.split(r"[\n;]+", str(transition_plan))
+        for raw_entry in entries:
+            entry = raw_entry.strip()
+            if not entry or entry.startswith("#"):
+                continue
+
+            parts = [part.strip() for part in re.split(r"[:=,\s]+", entry) if part.strip()]
+            if len(parts) < 2:
+                raise ValueError(f"Invalid transition_plan entry: '{entry}'. Use 'pair:transition:frames'.")
+
+            try:
+                pair_index = int(parts[0])
+            except ValueError as exc:
+                raise ValueError(f"Invalid transition_plan pair index in '{entry}'.") from exc
+
+            transition = parts[1]
+            if transition not in self.PAIR_TRANSITIONS:
+                raise ValueError(
+                    f"Invalid transition '{transition}' in transition_plan entry '{entry}'. "
+                    f"Valid transitions: {', '.join(self.PAIR_TRANSITIONS)}"
+                )
+
+            frames = None
+            if len(parts) >= 3:
+                try:
+                    frames = max(0, int(parts[2]))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid frame count in transition_plan entry '{entry}'.") from exc
+
+            plan[pair_index] = (transition, frames)
+
+        return plan
+
+    def _merge_pair(self, current, next_batch, transition, requested_frames, transition_mode, easing, wipe_softness, effect_intensity):
+        if transition == "cut" or requested_frames <= 0:
+            return torch.cat([current, next_batch], dim=0), "cut", 0
+
+        mode = self._mode_for_transition(transition, transition_mode)
+
+        if mode == "overlap":
+            frames = min(int(requested_frames), int(current.shape[0]), int(next_batch.shape[0]))
+            if frames <= 0:
+                return torch.cat([current, next_batch], dim=0), mode, 0
+            a = current[-frames:]
+            b = next_batch[:frames]
+            progress = self._progress(frames, current.device, current.dtype, easing)
+            transition_frames = self._render_transition(a, b, transition, progress, wipe_softness, effect_intensity)
+            return torch.cat([current[:-frames], transition_frames, next_batch[frames:]], dim=0).clamp(0.0, 1.0), mode, frames
+
+        frames = int(requested_frames)
+        if frames <= 0:
+            return torch.cat([current, next_batch], dim=0), mode, 0
+        a = current[-1:].expand(frames, -1, -1, -1)
+        b = next_batch[:1].expand(frames, -1, -1, -1)
+        progress = self._progress(frames, current.device, current.dtype, easing)
+        transition_frames = self._render_transition(a, b, transition, progress, wipe_softness, effect_intensity)
+        return torch.cat([current, transition_frames, next_batch], dim=0).clamp(0.0, 1.0), mode, frames
+
+    def _merge_audio_pair(
+        self,
+        current_audio,
+        next_audio,
+        current_frame_count,
+        next_frame_count,
+        resolved_mode,
+        actual_transition_frames,
+        transition,
+        easing,
+        fps,
+        sample_rate,
+    ):
+        if transition == "cut" or actual_transition_frames <= 0:
+            merged = torch.cat([current_audio, next_audio], dim=-1)
+            return self._fit_audio_to_frames(merged, current_frame_count + next_frame_count, fps, sample_rate)
+
+        if resolved_mode == "overlap":
+            pre_audio = self._audio_slice_for_frames(
+                current_audio,
+                0,
+                current_frame_count - actual_transition_frames,
+                fps,
+                sample_rate,
+            )
+            outgoing_audio = self._audio_slice_for_frames(
+                current_audio,
+                current_frame_count - actual_transition_frames,
+                current_frame_count,
+                fps,
+                sample_rate,
+            )
+            incoming_audio = self._audio_slice_for_frames(
+                next_audio,
+                0,
+                actual_transition_frames,
+                fps,
+                sample_rate,
+            )
+            post_audio = self._audio_slice_for_frames(
+                next_audio,
+                actual_transition_frames,
+                next_frame_count,
+                fps,
+                sample_rate,
+            )
+            overlap_audio = self._mix_overlap_audio(outgoing_audio, incoming_audio, easing)
+            merged = torch.cat([pre_audio, overlap_audio, post_audio], dim=-1)
+            return self._fit_audio_to_frames(
+                merged,
+                current_frame_count + next_frame_count - actual_transition_frames,
+                fps,
+                sample_rate,
+            )
+
+        transition_silence = self._silence_for_frames(actual_transition_frames, current_audio, fps, sample_rate)
+        merged = torch.cat([current_audio, transition_silence, next_audio], dim=-1)
+        return self._fit_audio_to_frames(
+            merged,
+            current_frame_count + actual_transition_frames + next_frame_count,
+            fps,
+            sample_rate,
+        )
+
+    def merge_transitions(
+        self,
+        image_batch_1,
+        image_batch_2,
+        inputcount,
+        fps,
+        transition_mode,
+        default_transition,
+        default_transition_frames,
+        easing,
+        size_match,
+        resize_method,
+        wipe_softness,
+        effect_intensity,
+        audio_1=None,
+        audio_2=None,
+        transition_plan="",
+        **kwargs,
+    ):
+        if "batch_count" in kwargs:
+            inputcount = kwargs["batch_count"]
+        inputcount = max(2, min(int(inputcount), self.MAX_BATCHES))
+        fps = float(fps)
+        if fps <= 0:
+            raise ValueError("fps must be greater than 0.")
+
+        batches = [
+            self._validate_batch(image_batch_1, "image_batch_1"),
+            self._validate_batch(image_batch_2, "image_batch_2"),
+        ]
+        audios = [
+            self._coerce_audio_input(audio_1, "audio_1"),
+            self._coerce_audio_input(audio_2, "audio_2"),
+        ]
+        for index in range(3, inputcount + 1):
+            batch = kwargs.get(f"image_batch_{index}")
+            if batch is None:
+                raise ValueError(
+                    f"image_batch_{index} must be connected when inputcount is {inputcount}. "
+                    "Set inputcount, click Update inputs, then connect the added slot."
+                )
+            batches.append(self._validate_batch(batch, f"image_batch_{index}"))
+            audios.append(self._coerce_audio_input(kwargs.get(f"audio_{index}"), f"audio_{index}"))
+
+        batches = self._prepare_batches(batches, size_match, resize_method)
+        transition_overrides = self._parse_transition_plan(transition_plan)
+        input_frame_counts = [int(batch.shape[0]) for batch in batches]
+        sample_rate = self._choose_audio_sample_rate(audios)
+        audio_clips = self._prepare_audio_clips(audios, input_frame_counts, fps, sample_rate)
+
+        output = batches[0]
+        output_audio = audio_clips[0]
+        info = [
+            f"batches={inputcount}",
+            f"input_frames={input_frame_counts}",
+            f"size={int(output.shape[2])}x{int(output.shape[1])}",
+            f"fps={fps:g}",
+            f"audio_sample_rate={sample_rate}",
+        ]
+
+        for pair_index, next_batch in enumerate(batches[1:], start=1):
+            current_frame_count = int(output.shape[0])
+            next_frame_count = int(next_batch.shape[0])
+
+            if pair_index in transition_overrides:
+                transition, plan_frames = transition_overrides[pair_index]
+                pair_frames = plan_frames if plan_frames is not None else int(kwargs.get(f"transition_frames_{pair_index}", 0) or 0)
+            else:
+                transition = kwargs.get(f"transition_{pair_index}", "same_as_default")
+                pair_frames = int(kwargs.get(f"transition_frames_{pair_index}", 0) or 0)
+
+            if transition == "same_as_default":
+                transition = default_transition
+
+            requested_frames = pair_frames if pair_frames > 0 else int(default_transition_frames)
+            output, resolved_mode, actual_frames = self._merge_pair(
+                output,
+                next_batch,
+                transition,
+                requested_frames,
+                transition_mode,
+                easing,
+                wipe_softness,
+                effect_intensity,
+            )
+            output_audio = self._merge_audio_pair(
+                output_audio,
+                audio_clips[pair_index],
+                current_frame_count,
+                next_frame_count,
+                resolved_mode,
+                actual_frames,
+                transition,
+                easing,
+                fps,
+                sample_rate,
+            )
+            info.append(
+                f"{pair_index}->{pair_index + 1}: transition={transition}, mode={resolved_mode}, "
+                f"frames={actual_frames}, output_frames={int(output.shape[0])}"
+            )
+
+        frame_count = int(output.shape[0])
+        output_audio = self._fit_audio_to_frames(output_audio, frame_count, fps, sample_rate)
+        info.append(f"final_frames={frame_count}")
+        info.append(f"audio_samples={int(output_audio.shape[-1])}")
+        return (
+            output.contiguous(),
+            {"waveform": output_audio.contiguous(), "sample_rate": sample_rate},
+            fps,
+            frame_count,
+            "\n".join(info),
+        )
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -1447,6 +2340,8 @@ NODE_CLASS_MAPPINGS = {
     "TwoImageConcatenator": TwoImageConcatenator,
     "RaftOpticalFlowNode": RaftOpticalFlowNode,
     "BatchRaftOpticalFlowNode": BatchRaftOpticalFlowNode,
+    "FrameRateModulator": FrameRateModulator,
+    "VideoTransitionBatchMerger": VideoTransitionBatchMerger,
     "MostRecentFileSelector": MostRecentFileSelector,
     "MultilineTextSplitter": MultilineTextSplitter,
     "LoadTextLineFromFile": LoadTextLineFromFile
@@ -1459,6 +2354,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TwoImageConcatenator": "Two Image Concatenator (Buff)",
     "RaftOpticalFlowNode": "Raft Optical Flow Node (Buff)",
     "BatchRaftOpticalFlowNode": "Batch Raft Optical Flow Node (Buff)",
+    "FrameRateModulator": "Frame Rate Modulator (Buff)",
+    "VideoTransitionBatchMerger": "Video Transition Batch Merger (Buff)",
     "MostRecentFileSelector": "Most Recent File Selector (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
     "LoadTextLineFromFile": "Load Text Line From File (Buff)"
