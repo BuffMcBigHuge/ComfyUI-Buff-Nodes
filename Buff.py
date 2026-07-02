@@ -908,6 +908,82 @@ class MultilineTextSplitter:
         return tuple(results)
 
 
+class TextTemplateCombiner:
+    """Combines string inputs into one text output using numbered placeholders."""
+
+    MAX_INPUTS = 20
+    PLACEHOLDER_PATTERN = re.compile(r"(?<!\{)\{([1-9]\d*)\}(?!\})")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for index in range(1, cls.MAX_INPUTS + 1):
+            optional[f"text_{index}"] = ("STRING", {
+                "default": "",
+                "forceInput": True,
+                "tooltip": f"String inserted when the main text contains {{{index}}}."
+            })
+
+        return {
+            "required": {
+                "main": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Primary text template. Use {1}, {2}, etc. to insert connected text inputs."
+                }),
+                "inputcount": ("INT", {
+                    "default": 1,
+                    "min": 0,
+                    "max": cls.MAX_INPUTS,
+                    "step": 1,
+                    "tooltip": "Number of optional text inputs to show. The browser UI also increases this from placeholders in main."
+                }),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "combine_text"
+    CATEGORY = "utils"
+
+    @staticmethod
+    def _stringify(value):
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    def combine_text(self, main, inputcount=1, **kwargs):
+        main = self._stringify(main)
+        try:
+            inputcount = int(inputcount)
+        except (TypeError, ValueError):
+            inputcount = 1
+        inputcount = max(0, min(inputcount, self.MAX_INPUTS))
+
+        placeholder_indexes = [
+            int(match.group(1))
+            for match in self.PLACEHOLDER_PATTERN.finditer(main)
+            if int(match.group(1)) <= self.MAX_INPUTS
+        ]
+        active_count = max([inputcount] + placeholder_indexes) if placeholder_indexes else inputcount
+
+        replacements = {
+            str(index): self._stringify(kwargs.get(f"text_{index}", ""))
+            for index in range(1, active_count + 1)
+        }
+
+        def replace_placeholder(match):
+            index = match.group(1)
+            if int(index) > self.MAX_INPUTS:
+                return match.group(0)
+            return replacements.get(index, "")
+
+        return (self.PLACEHOLDER_PATTERN.sub(replace_placeholder, main),)
+
+
 class BatchRaftOpticalFlowNode:
     """
     Computes RAFT optical flow on consecutive pairs from an image batch.
@@ -1478,6 +1554,15 @@ class VideoTransitionBatchMerger:
         "whip_pan_up",
         "whip_pan_down",
         "light_leak",
+        "zoom",
+        "dissolve_zoom",
+        "checkerboard",
+        "band_slide",
+        "glitch",
+        "film_burn",
+        "spin",
+        "page_peel",
+        "cube_spin",
     ]
     PAIR_TRANSITIONS = ["same_as_default"] + TRANSITIONS
     NON_OVERLAP_TRANSITIONS = {
@@ -1576,6 +1661,17 @@ class VideoTransitionBatchMerger:
             })
         }
 
+        for index in range(3, cls.MAX_BATCHES + 1):
+            optional[f"image_batch_{index}"] = ("IMAGE", {
+                "tooltip": (
+                    f"Optional API-safe clip input for image_batch_{index}. "
+                    "Set inputcount high enough for this input to be used."
+                )
+            })
+            optional[f"audio_{index}"] = ("AUDIO,VHS_AUDIO", {
+                "tooltip": f"Optional audio paired with image_batch_{index}."
+            })
+
         return {"required": required, "optional": optional}
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "STRING")
@@ -1620,6 +1716,29 @@ class VideoTransitionBatchMerger:
     @staticmethod
     def _mix(a, b, alpha):
         return a * (1.0 - alpha) + b * alpha
+
+    @staticmethod
+    def _normalize_transition_name(transition):
+        normalized = str(transition).strip().lower().replace("-", "_")
+        aliases = {
+            "cross_dissolve": "cross_dissolve",
+            "crossfade": "cross_dissolve",
+            "dip_black": "dip_to_black",
+            "fade_black": "dip_to_black",
+            "fade_to_black": "dip_to_black",
+            "dip_white": "dip_to_white",
+            "fade_white": "dip_to_white",
+            "fade_through_white": "dip_to_white",
+            "iris_wipe": "iris_circle",
+            "clock_wipe": "radial_clock_wipe",
+            "morph": "morph_cut",
+            "film_burn": "film_burn",
+            "page_peel": "page_peel",
+            "cube_spin": "cube_spin",
+            "dissolve_zoom": "dissolve_zoom",
+            "band_slide": "band_slide",
+        }
+        return aliases.get(normalized, normalized)
 
     @staticmethod
     def _target_size(batches, size_match):
@@ -2066,6 +2185,199 @@ class VideoTransitionBatchMerger:
         white_peak = torch.pow(peak, 4.0) * 0.40 * min(max(float(effect_intensity), 0.0), 3.0)
         return (base + flare * color + white_peak).clamp(0.0, 1.0)
 
+    @staticmethod
+    def _uv_fields(images):
+        n, h, w, _ = images.shape
+        device = images.device
+        dtype = images.dtype
+        xs = torch.linspace(0.0, 1.0, w, device=device, dtype=dtype).view(1, 1, w, 1)
+        ys = torch.linspace(0.0, 1.0, h, device=device, dtype=dtype).view(1, h, 1, 1)
+        return xs.expand(n, h, w, 1), ys.expand(n, h, w, 1)
+
+    @staticmethod
+    def _pseudo_noise(field):
+        return torch.remainder(torch.sin(field) * 43758.5453123, 1.0)
+
+    def _sample_batch(self, images, sample_x, sample_y):
+        n, h, w, _ = images.shape
+        if sample_x.shape[0] == 1 and n > 1:
+            sample_x = sample_x.expand(n, -1, -1, -1)
+        if sample_y.shape[0] == 1 and n > 1:
+            sample_y = sample_y.expand(n, -1, -1, -1)
+        grid = torch.cat([sample_x * 2.0 - 1.0, sample_y * 2.0 - 1.0], dim=-1)
+        sampled = torch_nn_func.grid_sample(
+            images.permute(0, 3, 1, 2),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        return sampled.permute(0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def _bounds_mask(sample_x, sample_y, n):
+        mask = ((sample_x >= 0.0) & (sample_x <= 1.0) & (sample_y >= 0.0) & (sample_y <= 1.0)).to(sample_x.dtype)
+        if mask.shape[0] == 1 and n > 1:
+            mask = mask.expand(n, -1, -1, -1)
+        return mask
+
+    def _render_zoom(self, a, b, progress, effect_intensity):
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        peak = torch.sin(progress * np.pi).clamp(0.0, 1.0)
+        scale_a = 1.0 + 0.10 * effect * progress
+        scale_b = 0.55 + 0.45 * progress
+        ax = (xs - 0.5) / scale_a + 0.5
+        ay = (ys - 0.5) / scale_a + 0.5
+        bx = (xs - 0.5) / scale_b + 0.5
+        by = (ys - 0.5) / scale_b + 0.5
+        a_zoom = self._sample_batch(a, ax, ay)
+        b_zoom = self._sample_batch(b, bx, by)
+        out = self._mix(a_zoom, b_zoom, progress)
+        return (out + peak * 0.03 * effect).clamp(0.0, 1.0)
+
+    def _render_dissolve_zoom(self, a, b, progress, effect_intensity):
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        scale_a = 1.0 + 0.22 * effect * progress
+        scale_b = 1.12 - 0.12 * progress
+        a_zoom = self._sample_batch(a, (xs - 0.5) / scale_a + 0.5, (ys - 0.5) / scale_a + 0.5)
+        b_zoom = self._sample_batch(b, (xs - 0.5) / scale_b + 0.5, (ys - 0.5) / scale_b + 0.5)
+        noise = self._pseudo_noise(xs * 127.1 + ys * 311.7)
+        alpha = (progress * (1.0 + 0.20 * effect) + (noise - 0.5) * 0.30).clamp(0.0, 1.0)
+        return self._mix(a_zoom, b_zoom, alpha).clamp(0.0, 1.0)
+
+    def _render_checkerboard(self, a, b, progress, effect_intensity):
+        n, h, w, _ = a.shape
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        rows = max(4, int(round(6 + effect * 4)))
+        cols = max(4, int(round(rows * w / max(h, 1))))
+        tile_x = torch.floor(xs * cols)
+        tile_y = torch.floor(ys * rows)
+        phase = torch.remainder(tile_x + tile_y, 2.0) * 0.42
+        mask = ((progress - phase) / 0.58).clamp(0.0, 1.0)
+        mask = self._apply_easing(mask, "smoothstep")
+        return self._mix(a, b, mask).clamp(0.0, 1.0)
+
+    def _render_band_slide(self, a, b, progress, effect_intensity):
+        n, _, _, _ = a.shape
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        bands = max(4, int(round(8 + effect * 5)))
+        band = torch.floor(ys * bands)
+        direction = torch.where(torch.remainder(band, 2.0) == 0.0, 1.0, -1.0)
+        offset = direction * (1.0 - progress)
+        sample_x = xs - offset
+        sample_y = ys
+        slid_b = self._sample_batch(b, sample_x, sample_y)
+        mask = self._bounds_mask(sample_x, sample_y, n)
+        shadow = (1.0 - torch.abs(sample_x.clamp(0.0, 1.0) - xs).clamp(0.0, 1.0)) * 0.08
+        out = a * (1.0 - mask) + slid_b * mask
+        return (out - shadow * mask * (1.0 - progress)).clamp(0.0, 1.0)
+
+    def _render_glitch(self, a, b, progress, effect_intensity):
+        n, h, w, c = a.shape
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        peak = torch.sin(progress * np.pi).clamp(0.0, 1.0)
+        band_count = max(12, int(round(18 + effect * 8)))
+        bands = torch.floor(ys * band_count)
+        band_noise = self._pseudo_noise(bands * 19.19 + progress * 113.7)
+        offset = (band_noise - 0.5) * peak * (0.12 + 0.05 * effect)
+        a_shifted = self._sample_batch(a, xs + offset * progress, ys)
+        b_shifted = self._sample_batch(b, xs - offset * (1.0 - progress), ys)
+        alpha = (progress + (band_noise - 0.5) * peak * 0.45).clamp(0.0, 1.0)
+        base = self._mix(a_shifted, b_shifted, alpha)
+        if c >= 3:
+            split = peak * (0.006 + 0.010 * effect)
+            red = self._sample_batch(base, xs + split, ys)[..., 0:1]
+            green = base[..., 1:2]
+            blue = self._sample_batch(base, xs - split, ys)[..., 2:3]
+            if c > 3:
+                base = torch.cat([red, green, blue, base[..., 3:]], dim=-1)
+            else:
+                base = torch.cat([red, green, blue], dim=-1)
+        tear = (band_noise > (0.82 - 0.04 * effect)).to(base.dtype) * peak
+        return (base + tear * 0.08).clamp(0.0, 1.0)
+
+    def _render_film_burn(self, a, b, progress, effect_intensity):
+        _, _, _, c = a.shape
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        edge = progress * 1.35 - 0.18
+        field = xs + 0.12 * torch.sin(ys * 17.0 + progress * 6.0)
+        reveal = ((edge - field) / 0.16 + 0.5).clamp(0.0, 1.0)
+        reveal = self._apply_easing(reveal, "smoothstep")
+        base = self._mix(a, b, reveal)
+        peak = torch.sin(progress * np.pi).clamp(0.0, 1.0)
+        hot_edge = torch.exp(-torch.pow(field - edge, 2.0) / 0.010) * peak
+        burn_color = torch.ones((1, 1, 1, c), device=a.device, dtype=a.dtype)
+        if c >= 3:
+            burn_color[..., 0] = 1.0
+            burn_color[..., 1] = 0.45
+            burn_color[..., 2] = 0.08
+        white = torch.pow(peak, 5.0) * 0.55
+        return (base + hot_edge * burn_color * (0.75 + 0.35 * effect) + white).clamp(0.0, 1.0)
+
+    def _rotated_sample(self, images, angle, scale):
+        xs, ys = self._uv_fields(images)
+        dx = xs - 0.5
+        dy = ys - 0.5
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+        safe_scale = scale.clamp(min=0.001)
+        sample_x = (dx * cos_a + dy * sin_a) / safe_scale + 0.5
+        sample_y = (-dx * sin_a + dy * cos_a) / safe_scale + 0.5
+        return self._sample_batch(images, sample_x, sample_y)
+
+    def _render_spin(self, a, b, progress, effect_intensity):
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        peak = torch.sin(progress * np.pi).clamp(0.0, 1.0)
+        angle = progress * np.pi * (1.0 + 0.25 * effect)
+        scale = 1.0 + peak * 0.18
+        a_spin = self._rotated_sample(a, angle, scale)
+        b_spin = self._rotated_sample(b, angle - np.pi * (1.0 + 0.25 * effect), scale)
+        return self._mix(a_spin, b_spin, progress).clamp(0.0, 1.0)
+
+    def _render_page_peel(self, a, b, progress, effect_intensity):
+        n, _, _, _ = a.shape
+        xs, ys = self._uv_fields(a)
+        effect = min(max(float(effect_intensity), 0.0), 3.0)
+        edge = 1.08 - progress * 1.30
+        field = xs + (1.0 - ys) * 0.22
+        reveal = ((field - edge) / 0.035 + 0.5).clamp(0.0, 1.0)
+        base = self._mix(a, b, reveal)
+        curl_width = 0.10 + 0.025 * effect
+        curl_mask = (1.0 - torch.abs(field - edge) / curl_width).clamp(0.0, 1.0)
+        mirrored_x = (2.0 * edge - xs).clamp(-0.25, 1.25)
+        curled = self._sample_batch(a, mirrored_x, ys)
+        curl_bounds = self._bounds_mask(mirrored_x, ys, n)
+        highlight = curl_mask * (0.18 + 0.08 * effect)
+        shadow = curl_mask * (1.0 - reveal) * 0.22
+        out = self._mix(base, curled + highlight, curl_mask * curl_bounds * (1.0 - reveal * 0.7))
+        return (out - shadow).clamp(0.0, 1.0)
+
+    def _render_cube_spin(self, a, b, progress, effect_intensity):
+        n, _, _, _ = a.shape
+        xs, ys = self._uv_fields(a)
+        angle = progress * (np.pi / 2.0)
+        scale_a = torch.cos(angle).clamp(min=0.001)
+        scale_b = torch.sin(angle).clamp(min=0.001)
+        center_a = 0.5 - 0.5 * torch.sin(angle)
+        center_b = 1.0 - 0.5 * torch.sin(angle)
+        ax = (xs - center_a) / scale_a + 0.5
+        bx = (xs - center_b) / scale_b + 0.5
+        mask_a = (torch.abs(xs - center_a) <= scale_a * 0.5).to(a.dtype)
+        mask_b = (torch.abs(xs - center_b) <= scale_b * 0.5).to(a.dtype)
+        mask_a = mask_a * self._bounds_mask(ax, ys, n)
+        mask_b = mask_b * self._bounds_mask(bx, ys, n)
+        face_a = self._sample_batch(a, ax, ys) * (0.42 + 0.58 * scale_a)
+        face_b = self._sample_batch(b, bx, ys) * (0.42 + 0.58 * scale_b)
+        out = face_a * mask_a * (1.0 - mask_b) + face_b * mask_b
+        gap = 1.0 - (mask_a + mask_b).clamp(0.0, 1.0)
+        return (out + gap * 0.015).clamp(0.0, 1.0)
+
     def _render_transition(self, a, b, transition, progress, wipe_softness, effect_intensity):
         if transition == "cross_dissolve":
             return self._mix(a, b, progress)
@@ -2083,6 +2395,24 @@ class VideoTransitionBatchMerger:
             return self._render_whip_pan(a, b, transition, progress, effect_intensity)
         if transition == "light_leak":
             return self._render_light_leak(a, b, progress, effect_intensity)
+        if transition == "zoom":
+            return self._render_zoom(a, b, progress, effect_intensity)
+        if transition == "dissolve_zoom":
+            return self._render_dissolve_zoom(a, b, progress, effect_intensity)
+        if transition == "checkerboard":
+            return self._render_checkerboard(a, b, progress, effect_intensity)
+        if transition == "band_slide":
+            return self._render_band_slide(a, b, progress, effect_intensity)
+        if transition == "glitch":
+            return self._render_glitch(a, b, progress, effect_intensity)
+        if transition == "film_burn":
+            return self._render_film_burn(a, b, progress, effect_intensity)
+        if transition == "spin":
+            return self._render_spin(a, b, progress, effect_intensity)
+        if transition == "page_peel":
+            return self._render_page_peel(a, b, progress, effect_intensity)
+        if transition == "cube_spin":
+            return self._render_cube_spin(a, b, progress, effect_intensity)
         return b
 
     def _mode_for_transition(self, transition, transition_mode):
@@ -2110,7 +2440,7 @@ class VideoTransitionBatchMerger:
             except ValueError as exc:
                 raise ValueError(f"Invalid transition_plan pair index in '{entry}'.") from exc
 
-            transition = parts[1]
+            transition = self._normalize_transition_name(parts[1])
             if transition not in self.PAIR_TRANSITIONS:
                 raise ValueError(
                     f"Invalid transition '{transition}' in transition_plan entry '{entry}'. "
@@ -2288,8 +2618,14 @@ class VideoTransitionBatchMerger:
                 transition = kwargs.get(f"transition_{pair_index}", "same_as_default")
                 pair_frames = int(kwargs.get(f"transition_frames_{pair_index}", 0) or 0)
 
+            transition = self._normalize_transition_name(transition)
             if transition == "same_as_default":
-                transition = default_transition
+                transition = self._normalize_transition_name(default_transition)
+            if transition not in self.TRANSITIONS:
+                raise ValueError(
+                    f"Invalid transition '{transition}' for pair {pair_index}. "
+                    f"Valid transitions: {', '.join(self.TRANSITIONS)}"
+                )
 
             requested_frames = pair_frames if pair_frames > 0 else int(default_transition_frames)
             output, resolved_mode, actual_frames = self._merge_pair(
@@ -2332,6 +2668,807 @@ class VideoTransitionBatchMerger:
         )
 
 
+class VideoFilterBatch:
+    """Applies video-style color presets and effects to a ComfyUI image batch."""
+
+    FILTER_PRESETS = [
+        "none",
+        "sunset_glow",
+        "moonlight",
+        "cyberpunk",
+        "film_noir",
+        "dreamy",
+        "retro_vhs",
+        "teal_orange",
+        "bleach_bypass",
+        "cross_process",
+        "faded_film",
+        "warm_cinematic",
+        "cool_cinematic",
+        "vintage_chrome",
+        "golden_hour",
+        "sepia",
+        "kodak_portra",
+        "fuji_velvia",
+        "polaroid",
+        "horror_green",
+        "arctic_blue",
+        "desert_heat",
+        "matrix_green",
+    ]
+
+    EFFECTS = [
+        "none",
+        "sharpen",
+        "chromatic_aberration",
+        "vignette",
+        "film_grain",
+        "glitch",
+        "rgb_split",
+        "lens_distortion",
+        "motion_blur",
+        "posterize",
+        "duotone",
+        "bloom",
+        "scanlines",
+    ]
+
+    PRESET_CONFIG = {
+        "sunset_glow": {
+            "exposure": 0.08,
+            "contrast": 1.08,
+            "saturation": 1.22,
+            "temperature": 0.52,
+            "tint": 0.08,
+            "highlights": ((1.0, 0.52, 0.18), 0.12),
+            "shadows": ((0.30, 0.08, 0.18), 0.04),
+        },
+        "moonlight": {
+            "exposure": -0.05,
+            "contrast": 1.06,
+            "saturation": 0.74,
+            "temperature": -0.58,
+            "tint": -0.08,
+            "shadows": ((0.10, 0.20, 0.62), 0.16),
+            "highlights": ((0.58, 0.72, 1.0), 0.06),
+        },
+        "cyberpunk": {
+            "exposure": 0.03,
+            "contrast": 1.24,
+            "saturation": 1.45,
+            "temperature": -0.18,
+            "tint": 0.38,
+            "shadows": ((0.00, 0.72, 1.0), 0.12),
+            "highlights": ((1.0, 0.04, 0.72), 0.14),
+            "curve": 0.20,
+        },
+        "film_noir": {
+            "exposure": -0.03,
+            "contrast": 1.36,
+            "saturation": 0.0,
+            "fade": 0.04,
+            "curve": 0.30,
+        },
+        "dreamy": {
+            "exposure": 0.12,
+            "contrast": 0.86,
+            "saturation": 1.08,
+            "temperature": 0.18,
+            "fade": 0.18,
+            "soft_glow": 0.28,
+        },
+        "retro_vhs": {
+            "exposure": -0.02,
+            "contrast": 1.10,
+            "saturation": 0.82,
+            "temperature": 0.16,
+            "tint": 0.16,
+            "fade": 0.12,
+            "channel_multipliers": (1.08, 0.96, 1.03),
+            "scanline_mix": 0.06,
+        },
+        "teal_orange": {
+            "contrast": 1.12,
+            "saturation": 1.16,
+            "shadows": ((0.00, 0.52, 0.58), 0.14),
+            "midtones": ((0.96, 0.46, 0.12), 0.04),
+            "highlights": ((1.0, 0.56, 0.18), 0.10),
+        },
+        "bleach_bypass": {
+            "exposure": -0.02,
+            "contrast": 1.32,
+            "saturation": 0.48,
+            "curve": 0.20,
+        },
+        "cross_process": {
+            "contrast": 1.18,
+            "saturation": 1.28,
+            "temperature": 0.12,
+            "tint": -0.20,
+            "channel_multipliers": (1.10, 1.04, 0.92),
+            "shadows": ((0.04, 0.20, 0.60), 0.08),
+            "highlights": ((0.98, 0.88, 0.28), 0.10),
+        },
+        "faded_film": {
+            "exposure": 0.04,
+            "contrast": 0.88,
+            "saturation": 0.82,
+            "temperature": 0.14,
+            "fade": 0.28,
+            "shadows": ((0.14, 0.12, 0.10), 0.04),
+        },
+        "warm_cinematic": {
+            "exposure": 0.03,
+            "contrast": 1.16,
+            "saturation": 1.06,
+            "temperature": 0.30,
+            "shadows": ((0.08, 0.20, 0.32), 0.07),
+            "highlights": ((1.0, 0.72, 0.38), 0.08),
+        },
+        "cool_cinematic": {
+            "exposure": -0.02,
+            "contrast": 1.16,
+            "saturation": 0.98,
+            "temperature": -0.34,
+            "shadows": ((0.04, 0.18, 0.42), 0.12),
+            "highlights": ((0.76, 0.90, 1.0), 0.04),
+        },
+        "vintage_chrome": {
+            "contrast": 1.18,
+            "saturation": 1.32,
+            "temperature": 0.20,
+            "tint": -0.04,
+            "fade": 0.08,
+            "curve": 0.18,
+        },
+        "golden_hour": {
+            "exposure": 0.08,
+            "contrast": 1.08,
+            "saturation": 1.18,
+            "temperature": 0.44,
+            "highlights": ((1.0, 0.68, 0.22), 0.14),
+            "shadows": ((0.22, 0.10, 0.04), 0.04),
+        },
+        "sepia": {
+            "contrast": 1.04,
+            "saturation": 0.42,
+            "temperature": 0.42,
+            "channel_multipliers": (1.16, 1.00, 0.78),
+            "fade": 0.10,
+        },
+        "kodak_portra": {
+            "exposure": 0.05,
+            "contrast": 0.96,
+            "saturation": 1.10,
+            "temperature": 0.16,
+            "tint": 0.05,
+            "highlights": ((1.0, 0.78, 0.58), 0.05),
+        },
+        "fuji_velvia": {
+            "contrast": 1.20,
+            "saturation": 1.42,
+            "temperature": -0.04,
+            "curve": 0.22,
+            "shadows": ((0.04, 0.18, 0.26), 0.05),
+        },
+        "polaroid": {
+            "exposure": 0.10,
+            "contrast": 0.90,
+            "saturation": 0.92,
+            "temperature": 0.22,
+            "fade": 0.22,
+            "highlights": ((1.0, 0.88, 0.62), 0.06),
+        },
+        "horror_green": {
+            "exposure": -0.08,
+            "contrast": 1.26,
+            "saturation": 0.72,
+            "temperature": -0.26,
+            "tint": -0.48,
+            "shadows": ((0.00, 0.24, 0.08), 0.18),
+            "highlights": ((0.68, 1.0, 0.50), 0.05),
+        },
+        "arctic_blue": {
+            "exposure": 0.03,
+            "contrast": 1.06,
+            "saturation": 0.84,
+            "temperature": -0.62,
+            "shadows": ((0.06, 0.22, 0.56), 0.14),
+            "highlights": ((0.72, 0.92, 1.0), 0.08),
+        },
+        "desert_heat": {
+            "exposure": 0.08,
+            "contrast": 1.14,
+            "saturation": 1.12,
+            "temperature": 0.58,
+            "tint": -0.06,
+            "shadows": ((0.36, 0.12, 0.02), 0.07),
+            "highlights": ((1.0, 0.72, 0.28), 0.12),
+        },
+        "matrix_green": {
+            "exposure": -0.04,
+            "contrast": 1.18,
+            "saturation": 0.66,
+            "temperature": -0.36,
+            "tint": -0.52,
+            "channel_multipliers": (0.74, 1.22, 0.78),
+            "shadows": ((0.00, 0.20, 0.04), 0.16),
+        },
+    }
+
+    EFFECT_ALIASES = {
+        "ca": "chromatic_aberration",
+        "chromatic": "chromatic_aberration",
+        "grain": "film_grain",
+        "vhs_glitch": "glitch",
+        "rgb": "rgb_split",
+        "rgb_shift": "rgb_split",
+        "distortion": "lens_distortion",
+        "blur": "motion_blur",
+        "motion": "motion_blur",
+        "posterize_color": "posterize",
+        "duo_tone": "duotone",
+        "scanline": "scanlines",
+    }
+
+    PRESET_ALIASES = {
+        "teal_and_orange": "teal_orange",
+        "tealorange": "teal_orange",
+        "black_and_white": "film_noir",
+        "bw": "film_noir",
+        "noir": "film_noir",
+        "vhs": "retro_vhs",
+        "faded": "faded_film",
+        "portra": "kodak_portra",
+        "velvia": "fuji_velvia",
+        "horror": "horror_green",
+        "arctic": "arctic_blue",
+        "desert": "desert_heat",
+        "matrix": "matrix_green",
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Input ComfyUI IMAGE batch [frames, height, width, channels]."
+                }),
+                "filter_preset": (cls.FILTER_PRESETS, {
+                    "default": "none",
+                    "tooltip": "Color grade preset. Use none when only applying effects."
+                }),
+                "preset_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "Preset strength. 1.0 is the designed look; values above 1 exaggerate it."
+                }),
+                "effect_1": (cls.EFFECTS, {
+                    "default": "none",
+                    "tooltip": "First optional effect in the chain."
+                }),
+                "effect_1_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 3.0,
+                    "step": 0.01,
+                    "tooltip": "Strength for effect_1."
+                }),
+                "effect_2": (cls.EFFECTS, {
+                    "default": "none",
+                    "tooltip": "Second optional effect in the chain."
+                }),
+                "effect_2_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 3.0,
+                    "step": 0.01,
+                    "tooltip": "Strength for effect_2."
+                }),
+                "effect_3": (cls.EFFECTS, {
+                    "default": "none",
+                    "tooltip": "Third optional effect in the chain."
+                }),
+                "effect_3_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 3.0,
+                    "step": 0.01,
+                    "tooltip": "Strength for effect_3."
+                }),
+                "global_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Final wet/dry mix between the original image batch and the filtered result."
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Seed for grain and glitch effects."
+                }),
+            },
+            "optional": {
+                "effect_stack": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": (
+                        "Optional extra effect chain, one per line. Examples:\n"
+                        "film_grain:0.35\n"
+                        "vignette:0.8\n"
+                        "chromatic-aberration:0.5"
+                    )
+                }),
+                "duotone_shadow": ("STRING", {
+                    "default": "#161026",
+                    "tooltip": "Shadow color for the duotone effect as #RRGGBB."
+                }),
+                "duotone_highlight": ("STRING", {
+                    "default": "#ffd166",
+                    "tooltip": "Highlight color for the duotone effect as #RRGGBB."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "filter_info")
+    FUNCTION = "apply_filters"
+    CATEGORY = "Image/Animation"
+
+    @staticmethod
+    def _normalize_name(value, aliases):
+        normalized = str(value or "none").strip().lower()
+        normalized = re.sub(r"[\s\-]+", "_", normalized)
+        return aliases.get(normalized, normalized)
+
+    @staticmethod
+    def _mix(a, b, alpha):
+        return a * (1.0 - alpha) + b * alpha
+
+    @staticmethod
+    def _validate_images(images):
+        if not isinstance(images, torch.Tensor):
+            raise TypeError("images must be a torch.Tensor in ComfyUI IMAGE format.")
+        if images.ndim != 4:
+            raise ValueError("images must be a 4D tensor: [frames, height, width, channels].")
+        if int(images.shape[-1]) < 3:
+            raise ValueError("images must have at least 3 color channels.")
+        if int(images.shape[0]) < 1:
+            raise ValueError("images must contain at least one frame.")
+        return images.float().clamp(0.0, 1.0)
+
+    @staticmethod
+    def _luma(rgb):
+        weights = torch.tensor([0.2126, 0.7152, 0.0722], device=rgb.device, dtype=rgb.dtype).view(1, 1, 1, 3)
+        return (rgb * weights).sum(dim=-1, keepdim=True)
+
+    @staticmethod
+    def _color_tensor(rgb, color):
+        return torch.tensor(color, device=rgb.device, dtype=rgb.dtype).view(1, 1, 1, 3)
+
+    @staticmethod
+    def _uv_fields(images):
+        n, h, w, _ = images.shape
+        xs = torch.linspace(0.0, 1.0, w, device=images.device, dtype=images.dtype).view(1, 1, w, 1)
+        ys = torch.linspace(0.0, 1.0, h, device=images.device, dtype=images.dtype).view(1, h, 1, 1)
+        return xs.expand(n, h, w, 1), ys.expand(n, h, w, 1)
+
+    @staticmethod
+    def _frame_index_field(images):
+        n = images.shape[0]
+        return torch.arange(n, device=images.device, dtype=images.dtype).view(n, 1, 1, 1)
+
+    @staticmethod
+    def _pseudo_noise(field):
+        return torch.remainder(torch.sin(field) * 43758.5453123, 1.0)
+
+    @staticmethod
+    def _parse_hex_color(value, fallback):
+        text = str(value or "").strip()
+        if text.startswith("#"):
+            text = text[1:]
+        if len(text) == 3:
+            text = "".join(ch * 2 for ch in text)
+        if len(text) != 6:
+            return fallback
+        try:
+            return tuple(int(text[index:index + 2], 16) / 255.0 for index in (0, 2, 4))
+        except ValueError:
+            return fallback
+
+    def _sample_rgb(self, rgb, sample_x, sample_y, padding_mode="border"):
+        n, _, _, _ = rgb.shape
+        if sample_x.shape[0] == 1 and n > 1:
+            sample_x = sample_x.expand(n, -1, -1, -1)
+        if sample_y.shape[0] == 1 and n > 1:
+            sample_y = sample_y.expand(n, -1, -1, -1)
+        grid = torch.cat([sample_x * 2.0 - 1.0, sample_y * 2.0 - 1.0], dim=-1)
+        sampled = torch_nn_func.grid_sample(
+            rgb.permute(0, 3, 1, 2),
+            grid,
+            mode="bilinear",
+            padding_mode=padding_mode,
+            align_corners=True,
+        )
+        return sampled.permute(0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def _bounds_mask(sample_x, sample_y, n):
+        mask = ((sample_x >= 0.0) & (sample_x <= 1.0) & (sample_y >= 0.0) & (sample_y <= 1.0)).to(sample_x.dtype)
+        if mask.shape[0] == 1 and n > 1:
+            mask = mask.expand(n, -1, -1, -1)
+        return mask
+
+    @staticmethod
+    def _box_blur(rgb, radius):
+        radius = int(max(0, min(radius, 48)))
+        if radius == 0:
+            return rgb
+        kernel = radius * 2 + 1
+        x = rgb.permute(0, 3, 1, 2)
+        x = torch_nn_func.pad(x, (radius, radius, radius, radius), mode="replicate")
+        x = torch_nn_func.avg_pool2d(x, kernel_size=kernel, stride=1)
+        return x.permute(0, 2, 3, 1).contiguous()
+
+    def _random_like(self, rgb, seed):
+        try:
+            generator = torch.Generator(device=rgb.device)
+            generator.manual_seed(int(seed) & 0x7fffffffffffffff)
+            return torch.rand(rgb.shape, device=rgb.device, dtype=rgb.dtype, generator=generator)
+        except (TypeError, RuntimeError):
+            torch.manual_seed(int(seed) & 0x7fffffff)
+            return torch.rand_like(rgb)
+
+    def _apply_tonal_grade(self, rgb, config, strength):
+        strength = min(max(float(strength), 0.0), 2.0)
+        if strength == 0.0:
+            return rgb
+
+        exposure = float(config.get("exposure", 0.0)) * strength
+        contrast = 1.0 + (float(config.get("contrast", 1.0)) - 1.0) * strength
+        saturation = 1.0 + (float(config.get("saturation", 1.0)) - 1.0) * strength
+        temperature = float(config.get("temperature", 0.0)) * strength
+        tint = float(config.get("tint", 0.0)) * strength
+        fade = min(max(float(config.get("fade", 0.0)) * strength, 0.0), 0.95)
+        curve = min(max(float(config.get("curve", 0.0)) * strength, -1.0), 1.0)
+
+        out = rgb * float(2.0 ** exposure)
+
+        temp_vector = torch.tensor(
+            [
+                1.0 + 0.22 * temperature + 0.08 * tint,
+                1.0 - 0.16 * tint,
+                1.0 - 0.22 * temperature + 0.08 * tint,
+            ],
+            device=rgb.device,
+            dtype=rgb.dtype,
+        ).view(1, 1, 1, 3)
+        out = out * temp_vector
+
+        if "channel_multipliers" in config:
+            multipliers = torch.tensor(config["channel_multipliers"], device=rgb.device, dtype=rgb.dtype).view(1, 1, 1, 3)
+            multipliers = 1.0 + (multipliers - 1.0) * strength
+            out = out * multipliers
+
+        out = (out - 0.5) * contrast + 0.5
+        gray = self._luma(out)
+        out = self._mix(gray, out, saturation)
+
+        if fade > 0.0:
+            out = out * (1.0 - 0.34 * fade) + 0.10 * fade
+
+        out = out.clamp(0.0, 1.0)
+        if curve > 0.0:
+            s_curve = out * out * (3.0 - 2.0 * out)
+            out = self._mix(out, s_curve, curve)
+        elif curve < 0.0:
+            soft_curve = torch.sqrt(out.clamp(0.0, 1.0))
+            out = self._mix(out, soft_curve, -curve)
+
+        return self._apply_color_balance(out, config, strength).clamp(0.0, 1.0)
+
+    def _apply_color_balance(self, rgb, config, strength):
+        luma = self._luma(rgb).clamp(0.0, 1.0)
+        masks = {
+            "shadows": torch.pow(1.0 - luma, 2.0),
+            "midtones": torch.pow((1.0 - torch.abs(luma - 0.5) * 2.0).clamp(0.0, 1.0), 2.0),
+            "highlights": torch.pow(luma, 2.0),
+        }
+        out = rgb
+        for key, mask in masks.items():
+            if key not in config:
+                continue
+            color, amount = config[key]
+            amount = float(amount) * min(max(float(strength), 0.0), 2.0)
+            color_tensor = self._color_tensor(rgb, color)
+            out = out + (color_tensor - 0.5) * 2.0 * mask * amount
+        return out
+
+    def _apply_preset(self, rgb, preset, strength):
+        preset = self._normalize_name(preset, self.PRESET_ALIASES)
+        if preset == "none" or float(strength) <= 0.0:
+            return rgb
+        if preset not in self.PRESET_CONFIG:
+            raise ValueError(f"Invalid filter_preset '{preset}'. Valid presets: {', '.join(self.FILTER_PRESETS)}")
+
+        config = self.PRESET_CONFIG[preset]
+        out = self._apply_tonal_grade(rgb, config, strength)
+
+        glow_mix = float(config.get("soft_glow", 0.0)) * min(max(float(strength), 0.0), 2.0)
+        if glow_mix > 0.0:
+            blur = self._box_blur(out, radius=4)
+            out = self._mix(out, blur + 0.04, min(glow_mix, 0.75)).clamp(0.0, 1.0)
+
+        scanline_mix = float(config.get("scanline_mix", 0.0)) * min(max(float(strength), 0.0), 2.0)
+        if scanline_mix > 0.0:
+            out = self._effect_scanlines(out, scanline_mix)
+
+        return out.clamp(0.0, 1.0)
+
+    def _effect_sharpen(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        blur = self._box_blur(rgb, radius=max(1, int(round(1 + amount))))
+        return (rgb + (rgb - blur) * (0.42 * amount)).clamp(0.0, 1.0)
+
+    def _effect_chromatic_aberration(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        xs, ys = self._uv_fields(rgb)
+        dx = xs - 0.5
+        dy = ys - 0.5
+        dist = torch.sqrt(dx * dx + dy * dy).clamp(0.0, 1.0)
+        offset = dist * (0.010 + 0.012 * amount) * amount
+        red = self._sample_rgb(rgb, xs + dx * offset, ys + dy * offset)[..., 0:1]
+        green = rgb[..., 1:2]
+        blue = self._sample_rgb(rgb, xs - dx * offset, ys - dy * offset)[..., 2:3]
+        return torch.cat([red, green, blue], dim=-1).clamp(0.0, 1.0)
+
+    def _effect_vignette(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        xs, ys = self._uv_fields(rgb)
+        _, h, w, _ = rgb.shape
+        aspect = float(w) / max(float(h), 1.0)
+        dx = (xs - 0.5) * min(aspect, 1.0) * 2.0
+        dy = (ys - 0.5) / max(aspect, 1.0) * 2.0
+        radius = torch.sqrt(dx * dx + dy * dy)
+        edge = ((radius - 0.38) / 0.72).clamp(0.0, 1.0)
+        edge = edge * edge * (3.0 - 2.0 * edge)
+        darken = min(0.82, 0.38 * amount)
+        feather = (1.0 - edge * darken).clamp(0.0, 1.0)
+        center_lift = (1.0 - edge) * min(0.06, 0.025 * amount)
+        return (rgb * feather + center_lift).clamp(0.0, 1.0)
+
+    def _effect_film_grain(self, rgb, strength, seed):
+        amount = min(max(float(strength), 0.0), 3.0)
+        noise = self._random_like(rgb, int(seed)) - 0.5
+        luma = self._luma(rgb)
+        shadow_bias = (1.25 - luma).clamp(0.25, 1.25)
+        return (rgb + noise * shadow_bias * (0.075 * amount)).clamp(0.0, 1.0)
+
+    def _effect_glitch(self, rgb, strength, seed):
+        amount = min(max(float(strength), 0.0), 3.0)
+        xs, ys = self._uv_fields(rgb)
+        frame_index = self._frame_index_field(rgb)
+        bands = torch.floor(ys * max(8, int(round(14 + amount * 10))))
+        band_noise = self._pseudo_noise(bands * 12.9898 + frame_index * 78.233 + float(seed) * 0.017)
+        active = (band_noise > (0.72 - 0.06 * amount)).to(rgb.dtype)
+        offset = (band_noise - 0.5) * active * (0.045 * amount)
+        shifted = self._sample_rgb(rgb, xs + offset, ys)
+
+        split = 0.006 * amount
+        red = self._sample_rgb(shifted, xs + split * active, ys)[..., 0:1]
+        green = shifted[..., 1:2]
+        blue = self._sample_rgb(shifted, xs - split * active, ys)[..., 2:3]
+        out = torch.cat([red, green, blue], dim=-1)
+        tear = active * self._pseudo_noise(bands * 41.7 + float(seed) * 0.13) * 0.10 * amount
+        return (out + tear).clamp(0.0, 1.0)
+
+    def _effect_rgb_split(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        _, _, w, _ = rgb.shape
+        xs, ys = self._uv_fields(rgb)
+        shift = (1.0 + 2.5 * amount) / max(float(w), 1.0)
+        red = self._sample_rgb(rgb, xs + shift, ys)[..., 0:1]
+        green = rgb[..., 1:2]
+        blue = self._sample_rgb(rgb, xs - shift, ys)[..., 2:3]
+        return torch.cat([red, green, blue], dim=-1).clamp(0.0, 1.0)
+
+    def _effect_lens_distortion(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        n, _, _, _ = rgb.shape
+        xs, ys = self._uv_fields(rgb)
+        dx = xs - 0.5
+        dy = ys - 0.5
+        r2 = (dx * dx + dy * dy).clamp(0.0, 0.5)
+        barrel = 0.30 * amount
+        edge_pull = 1.0 + barrel * r2 + 0.16 * amount * r2 * r2
+        zoom_compensation = 1.0 / (1.0 + 0.055 * amount)
+        sample_x = 0.5 + dx * edge_pull * zoom_compensation
+        sample_y = 0.5 + dy * edge_pull * zoom_compensation
+        warped = self._sample_rgb(rgb, sample_x, sample_y, padding_mode="zeros")
+        bounds = self._bounds_mask(sample_x, sample_y, n)
+        edge_fade = (1.0 - torch.pow(r2 / 0.5, 1.6) * (0.14 * amount)).clamp(0.0, 1.0)
+        return (warped * bounds * edge_fade).clamp(0.0, 1.0)
+
+    def _effect_motion_blur(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        frame_count = int(rgb.shape[0])
+        if frame_count <= 1 or amount <= 0.0:
+            return rgb
+
+        indices = torch.arange(frame_count, device=rgb.device)
+        radius = min(max(1, int(round(1 + amount * 2.0))), min(8, frame_count - 1))
+        acc = rgb * (1.0 + radius)
+        weight_sum = 1.0 + radius
+        for offset in range(1, radius + 1):
+            weight = float(radius + 1 - offset) / float(radius + 1)
+            prev_index = (indices - offset).clamp(0, frame_count - 1)
+            next_index = (indices + offset).clamp(0, frame_count - 1)
+            acc = acc + rgb.index_select(0, prev_index) * weight
+            acc = acc + rgb.index_select(0, next_index) * weight
+            weight_sum += weight * 2.0
+
+        temporal_blur = acc / float(weight_sum)
+        prev_frame = rgb.index_select(0, (indices - 1).clamp(0, frame_count - 1))
+        next_frame = rgb.index_select(0, (indices + 1).clamp(0, frame_count - 1))
+        motion_delta = (next_frame - prev_frame).abs().mean(dim=-1, keepdim=True)
+        motion_mask = (motion_delta * (5.5 + amount * 2.5)).clamp(0.0, 1.0)
+        wet = min(0.92, 0.28 + amount * 0.20)
+        return self._mix(rgb, temporal_blur, motion_mask * wet).clamp(0.0, 1.0)
+
+    def _effect_posterize(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        levels = max(2, int(round(12 - amount * 3.2)))
+        poster = torch.round(rgb * float(levels - 1)) / float(levels - 1)
+        return self._mix(rgb, poster, min(amount, 1.0)).clamp(0.0, 1.0)
+
+    def _effect_duotone(self, rgb, strength, shadow_color, highlight_color):
+        amount = min(max(float(strength), 0.0), 3.0)
+        shadow = self._color_tensor(rgb, shadow_color)
+        highlight = self._color_tensor(rgb, highlight_color)
+        luma = self._luma(rgb).clamp(0.0, 1.0)
+        mapped = shadow * (1.0 - luma) + highlight * luma
+        return self._mix(rgb, mapped, min(amount, 1.0)).clamp(0.0, 1.0)
+
+    def _effect_bloom(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        threshold = 0.64
+        bright = ((rgb - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
+        blur = self._box_blur(bright, radius=max(3, int(round(4 + amount * 4))))
+        return (rgb + blur * (0.18 * amount)).clamp(0.0, 1.0)
+
+    def _effect_scanlines(self, rgb, strength):
+        amount = min(max(float(strength), 0.0), 3.0)
+        n, h, _, _ = rgb.shape
+        rows = torch.arange(h, device=rgb.device, dtype=rgb.dtype).view(1, h, 1, 1)
+        frame_index = self._frame_index_field(rgb)
+        phase = torch.remainder(rows + frame_index, 2.0)
+        dark_line = (phase < 1.0).to(rgb.dtype)
+        fine_beam = 0.92 + 0.08 * torch.cos(rows * np.pi)
+        line_mask = (1.0 - dark_line * min(0.62, 0.24 * amount)) * fine_beam
+        rolling_bar = 1.0 - 0.035 * amount * torch.sin((rows / max(float(h), 1.0) + frame_index * 0.023) * np.pi * 2.0)
+        return (rgb * line_mask.clamp(0.0, 1.0) * rolling_bar.clamp(0.82, 1.08)).clamp(0.0, 1.0)
+
+    def _apply_effect(self, rgb, effect, strength, seed, duotone_shadow, duotone_highlight):
+        effect = self._normalize_name(effect, self.EFFECT_ALIASES)
+        if effect == "none" or float(strength) <= 0.0:
+            return rgb
+        if effect not in self.EFFECTS:
+            raise ValueError(f"Invalid effect '{effect}'. Valid effects: {', '.join(self.EFFECTS)}")
+
+        if effect == "sharpen":
+            return self._effect_sharpen(rgb, strength)
+        if effect == "chromatic_aberration":
+            return self._effect_chromatic_aberration(rgb, strength)
+        if effect == "vignette":
+            return self._effect_vignette(rgb, strength)
+        if effect == "film_grain":
+            return self._effect_film_grain(rgb, strength, seed)
+        if effect == "glitch":
+            return self._effect_glitch(rgb, strength, seed)
+        if effect == "rgb_split":
+            return self._effect_rgb_split(rgb, strength)
+        if effect == "lens_distortion":
+            return self._effect_lens_distortion(rgb, strength)
+        if effect == "motion_blur":
+            return self._effect_motion_blur(rgb, strength)
+        if effect == "posterize":
+            return self._effect_posterize(rgb, strength)
+        if effect == "duotone":
+            return self._effect_duotone(rgb, strength, duotone_shadow, duotone_highlight)
+        if effect == "bloom":
+            return self._effect_bloom(rgb, strength)
+        if effect == "scanlines":
+            return self._effect_scanlines(rgb, strength)
+        return rgb
+
+    def _parse_effect_stack(self, effect_stack):
+        entries = []
+        for raw_entry in re.split(r"[\n;]+", str(effect_stack or "")):
+            entry = raw_entry.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            parts = re.split(r"[:=,]", entry, maxsplit=1)
+            effect = self._normalize_name(parts[0], self.EFFECT_ALIASES)
+            if effect not in self.EFFECTS:
+                raise ValueError(f"Invalid effect_stack entry '{entry}'. Valid effects: {', '.join(self.EFFECTS)}")
+            strength = 1.0
+            if len(parts) > 1:
+                strength_text = parts[1].strip().split()[0] if parts[1].strip() else "1.0"
+                try:
+                    strength = float(strength_text)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid strength in effect_stack entry '{entry}'.") from exc
+            entries.append((effect, strength))
+        return entries
+
+    def apply_filters(
+        self,
+        images,
+        filter_preset,
+        preset_strength,
+        effect_1,
+        effect_1_strength,
+        effect_2,
+        effect_2_strength,
+        effect_3,
+        effect_3_strength,
+        global_strength,
+        seed,
+        effect_stack="",
+        duotone_shadow="#161026",
+        duotone_highlight="#ffd166",
+    ):
+        source = self._validate_images(images)
+        original_rgb = source[..., :3]
+        tail = source[..., 3:] if int(source.shape[-1]) > 3 else None
+        output_rgb = self._apply_preset(original_rgb, filter_preset, preset_strength)
+
+        shadow_color = self._parse_hex_color(duotone_shadow, (0.086, 0.063, 0.149))
+        highlight_color = self._parse_hex_color(duotone_highlight, (1.0, 0.820, 0.400))
+        effect_entries = [
+            (effect_1, effect_1_strength),
+            (effect_2, effect_2_strength),
+            (effect_3, effect_3_strength),
+        ]
+        effect_entries.extend(self._parse_effect_stack(effect_stack))
+
+        applied_effects = []
+        for index, (effect, strength) in enumerate(effect_entries):
+            normalized_effect = self._normalize_name(effect, self.EFFECT_ALIASES)
+            if normalized_effect == "none" or float(strength) <= 0.0:
+                continue
+            output_rgb = self._apply_effect(
+                output_rgb,
+                normalized_effect,
+                strength,
+                int(seed) + index * 1009,
+                shadow_color,
+                highlight_color,
+            )
+            applied_effects.append(f"{normalized_effect}:{float(strength):g}")
+
+        output_rgb = self._mix(original_rgb, output_rgb, min(max(float(global_strength), 0.0), 1.0)).clamp(0.0, 1.0)
+        if tail is not None:
+            output = torch.cat([output_rgb, tail], dim=-1)
+        else:
+            output = output_rgb
+
+        normalized_preset = self._normalize_name(filter_preset, self.PRESET_ALIASES)
+        info = [
+            f"preset={normalized_preset}",
+            f"preset_strength={float(preset_strength):g}",
+            f"effects={', '.join(applied_effects) if applied_effects else 'none'}",
+            f"global_strength={float(global_strength):g}",
+            f"frames={int(output.shape[0])}",
+            f"size={int(output.shape[2])}x{int(output.shape[1])}",
+        ]
+        return (output.contiguous(), "\n".join(info))
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -2342,8 +3479,10 @@ NODE_CLASS_MAPPINGS = {
     "BatchRaftOpticalFlowNode": BatchRaftOpticalFlowNode,
     "FrameRateModulator": FrameRateModulator,
     "VideoTransitionBatchMerger": VideoTransitionBatchMerger,
+    "VideoFilterBatch": VideoFilterBatch,
     "MostRecentFileSelector": MostRecentFileSelector,
     "MultilineTextSplitter": MultilineTextSplitter,
+    "TextTemplateCombiner": TextTemplateCombiner,
     "LoadTextLineFromFile": LoadTextLineFromFile
 }
 
@@ -2356,7 +3495,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BatchRaftOpticalFlowNode": "Batch Raft Optical Flow Node (Buff)",
     "FrameRateModulator": "Frame Rate Modulator (Buff)",
     "VideoTransitionBatchMerger": "Video Transition Batch Merger (Buff)",
+    "VideoFilterBatch": "Video Filter Batch (Buff)",
     "MostRecentFileSelector": "Most Recent File Selector (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
+    "TextTemplateCombiner": "Text Template Combiner (Buff)",
     "LoadTextLineFromFile": "Load Text Line From File (Buff)"
 }

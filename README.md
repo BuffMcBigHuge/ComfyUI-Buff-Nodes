@@ -43,6 +43,20 @@ The `MultilineTextSplitter` node splits multiline text into multiple output fiel
   - **Remove Empty Lines**: Optionally strip empty lines before splitting
 - **Output**: Up to 20 text outputs (`text_1` through `text_20`); unused outputs return empty strings
 
+## Text Template Combiner Node
+
+The `TextTemplateCombiner` node combines connected string inputs into one output using numbered placeholders in a primary text box:
+- **Template Replacement**:
+  - Write the base text in `main`
+  - Use `{1}`, `{2}`, etc. where connected strings should be inserted
+  - Example: `main = "foo bar {1}"`, `text_1 = "inserted string"` outputs `foo bar inserted string`
+- **Dynamic Inputs**:
+  - Set `inputcount`, then click `Update text inputs` to show exactly that many `text_N` sockets
+  - Adding placeholders such as `{4}` in `main` also expands the visible sockets up to `text_4`
+  - `text_1` through `text_20` are declared on the backend for API-safe workflows
+- **Output**:
+  - Single combined `STRING` output
+
 ## Load Text Line From File Node
 
 The `LoadTextLineFromFile` node loads text from a file and returns a specific line or all lines:
@@ -148,6 +162,7 @@ The `VideoTransitionBatchMerger` node merges multiple ComfyUI image batches into
   - Connect `image_batch_1` and `image_batch_2` for a standard A/B transition
   - Connect optional `audio_1` and `audio_2` when clips have audio; ComfyUI `AUDIO`, lazy `AUDIO` from Video Helper Suite `Load Video` nodes, and legacy `VHS_AUDIO` are accepted
   - Set `inputcount`, then click `Update inputs/transitions` to add or remove `image_batch_3+` and `audio_3+` sockets
+  - `image_batch_3` through `image_batch_64` and matching `audio_N` sockets are declared on the backend, so raw Prompt API workflows can connect them without relying on the browser UI
   - The same update button adds or removes `transition_N` and `transition_frames_N` controls for each clip boundary
   - `transition_plan` stores those dynamic pair controls for the backend and supports manual overrides such as `8:dip_to_white:10`
 - **Audio Timeline**:
@@ -163,6 +178,7 @@ The `VideoTransitionBatchMerger` node merges multiple ComfyUI image batches into
   - Radial/clock wipe
   - Iris circle, diamond, and star wipes
   - Push and slide transitions in all four directions
+  - Zoom, dissolve zoom, checkerboard, band slide, glitch, film burn, spin, page peel, and cube spin
 - **Non-Overlapping Inserted Transitions**:
   - Dip to black
   - Dip to white
@@ -179,6 +195,22 @@ The `VideoTransitionBatchMerger` node merges multiple ComfyUI image batches into
   - FPS passthrough
   - Final frame count
   - Timeline summary string for debugging
+
+## Video Filter Batch Node
+
+The `VideoFilterBatch` node applies tensor-based color presets and video effects to a ComfyUI image batch. It runs in the backend, so it works through the ComfyUI API without browser-only dependencies.
+- **Filter Presets**:
+  - Includes 22 looks: Sunset Glow, Moonlight, Cyberpunk, Film Noir, Dreamy, Retro VHS, Teal & Orange, Bleach Bypass, Cross Process, Faded Film, Warm/Cool Cinematic, Vintage Chrome, Golden Hour, Sepia, Kodak Portra, Fuji Velvia, Polaroid, Horror Green, Arctic Blue, Desert Heat, and Matrix Green
+  - `preset_strength` controls the intensity of the selected look
+- **Effects**:
+  - Includes Sharpen, Chromatic Aberration, Vignette, Film Grain, Glitch, RGB Split, Lens Distortion, Motion Blur, Posterize, Duotone, Bloom, and Scanlines
+  - Three dropdown effect slots are available for common UI use
+  - `effect_stack` accepts additional API-friendly lines such as `film_grain:0.35` or `chromatic-aberration:0.5`
+  - `seed` makes grain and glitch effects deterministic
+  - Motion Blur is temporal and motion-masked from adjacent frames, so static frames stay mostly unchanged
+- **Output**:
+  - Filtered image batch
+  - Filter summary string for debugging
 
 ## Raft Optical Flow Node
 

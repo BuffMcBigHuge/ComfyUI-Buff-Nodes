@@ -33,7 +33,34 @@ const TRANSITIONS = [
     "whip_pan_up",
     "whip_pan_down",
     "light_leak",
+    "zoom",
+    "dissolve_zoom",
+    "checkerboard",
+    "band_slide",
+    "glitch",
+    "film_burn",
+    "spin",
+    "page_peel",
+    "cube_spin",
 ];
+
+const TRANSITION_ALIASES = {
+    crossfade: "cross_dissolve",
+    dip_black: "dip_to_black",
+    fade_black: "dip_to_black",
+    fade_to_black: "dip_to_black",
+    dip_white: "dip_to_white",
+    fade_white: "dip_to_white",
+    fade_through_white: "dip_to_white",
+    iris_wipe: "iris_circle",
+    clock_wipe: "radial_clock_wipe",
+    morph: "morph_cut",
+};
+
+function normalizeTransitionName(value) {
+    const normalized = String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+    return TRANSITION_ALIASES[normalized] || normalized;
+}
 
 function hideWidget(widget) {
     if (!widget) {
@@ -133,7 +160,8 @@ function installDynamicTimelineControls(node) {
             if (!Number.isFinite(pairIndex) || pairIndex < 1) {
                 continue;
             }
-            const transition = TRANSITIONS.includes(parts[1]) ? parts[1] : "same_as_default";
+            const transitionName = normalizeTransitionName(parts[1]);
+            const transition = TRANSITIONS.includes(transitionName) ? transitionName : "same_as_default";
             const frames = Number.isFinite(Number.parseInt(parts[2], 10))
                 ? Math.max(0, Number.parseInt(parts[2], 10))
                 : 0;
