@@ -70,6 +70,25 @@ function installDynamicTextInputs(node) {
         const inputIndex = node.inputs?.findIndex((input) => input.name === name) ?? -1;
         if (inputIndex >= 0) {
             node.removeInput(inputIndex);
+            return true;
+        }
+        return false;
+    };
+
+    const growToFitSockets = () => {
+        const currentSize = node.size ? [...node.size] : [0, 0];
+        const computedSize = node.computeSize?.();
+        if (!computedSize) {
+            return;
+        }
+
+        const nextSize = [
+            Math.max(currentSize[0] || 0, computedSize[0] || 0),
+            Math.max(currentSize[1] || 0, computedSize[1] || 0),
+        ];
+
+        if (nextSize[0] !== currentSize[0] || nextSize[1] !== currentSize[1]) {
+            node.setSize?.(nextSize);
         }
     };
 
@@ -80,8 +99,9 @@ function installDynamicTextInputs(node) {
             inputCountWidget.value = targetInputCount;
         }
 
+        let socketsChanged = false;
         for (let index = maxInputs; index > targetInputCount; index--) {
-            removeInputByName(`text_${index}`);
+            socketsChanged = removeInputByName(`text_${index}`) || socketsChanged;
         }
 
         for (const input of getTextInputs()) {
@@ -91,10 +111,13 @@ function installDynamicTextInputs(node) {
         for (let index = 1; index <= targetInputCount; index++) {
             if (!node.inputs?.some((input) => input.name === `text_${index}`)) {
                 node.addInput(`text_${index}`, stringType, { shape: 7 });
+                socketsChanged = true;
             }
         }
 
-        node.setSize?.(node.computeSize());
+        if (socketsChanged) {
+            growToFitSockets();
+        }
         app.graph.setDirtyCanvas(true, true);
     };
 

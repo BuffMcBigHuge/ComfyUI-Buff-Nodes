@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-Buff-Nodes"
 description = "Assorted Nodes by BuffMcBigHuge"
-version = "1.0.12"
+version = "1.0.13"
 license = {text = "MIT License"}
 
 [project.urls]
