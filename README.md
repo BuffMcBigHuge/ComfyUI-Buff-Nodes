@@ -50,9 +50,13 @@ The `TextTemplateCombiner` node combines connected string inputs into one output
   - Write the base text in `main`
   - Use `{1}`, `{2}`, etc. where connected strings should be inserted
   - Example: `main = "foo bar {1}"`, `text_1 = "inserted string"` outputs `foo bar inserted string`
+- **Random Choices**:
+  - Use `{foo|bar}` to randomly output either `foo` or `bar`
+  - Pipe groups support more than two options, such as `{red|green|blue}`
+  - Numeric options can reference dynamic inputs: `{1|2}` randomly chooses `text_1` or `text_2`
 - **Dynamic Inputs**:
   - Set `inputcount`, then click `Update text inputs` to show exactly that many `text_N` sockets
-  - Adding placeholders such as `{4}` in `main` also expands the visible sockets up to `text_4`
+  - Adding placeholders such as `{4}` or choice groups such as `{1|4}` in `main` also expands the visible sockets up to `text_4`
   - `text_1` through `text_20` are declared on the backend for API-safe workflows
 - **Output**:
   - Single combined `STRING` output
@@ -211,6 +215,43 @@ The `VideoFilterBatch` node applies tensor-based color presets and video effects
 - **Output**:
   - Filtered image batch
   - Filter summary string for debugging
+
+## Video Trimmer Node
+
+The `VideoTrimmer` node allows you to perform versatile video trimming and framerate modulation with sample-accurate audio synchronization (preventing audio skew or pitch drift):
+- **Inputs**:
+  - **Native Video**: Connect native ComfyUI `VIDEO` objects (from `LoadVideo`, `CreateVideo`, etc.) with automatic framerate detection and audio extraction
+  - **Image Batches**: Connect ComfyUI `IMAGE` batches `[B, H, W, C]`
+  - **Audio**: Optional ComfyUI `AUDIO` dict or `VHS_AUDIO`
+- **Trimming Modes (`trim_mode`)**:
+  - `all`: Retains the entire clip (ideal for framerate conversion / resampling)
+  - `start_duration`: Extracts a segment from `start_value` with duration/length `duration_or_count` (supports negative start to index from the end)
+  - `start_end`: Extracts a segment between `start_value` and `end_value` (supports negative end indexing)
+  - `first_n`: Extracts the first N units (frames or seconds)
+  - `last_n`: Extracts the last N units (frames or seconds)
+  - `center_n`: Extracts N units centered around the midpoint of the video
+  - `cut_inside`: Removes a section between `start_value` and `end_value`, seamlessly splicing the preceding and succeeding segments and their audio
+- **Flexible Units (`trim_units`)**:
+  - `seconds`: Time-based trimming in real-world seconds
+  - `source_frames`: Trim by frame count / indices based on source framerate (e.g. extract last 48 frames of a 24 fps video)
+  - `output_frames`: Trim by frame count based on target framerate (e.g. extract last 24 frames when target fps is 12)
+  - `percentage`: Trim by percentage (0% to 100% of duration)
+- **Framerate Modulation & Audio Sync (`framerate_mode`)**:
+  - `keep_source`: Retains original framerate
+  - `custom_fps`: Resamples video frames to a specific target framerate (e.g. 12 fps, 24 fps, 60 fps) across the real-world trimmed duration. Because real playback time matches audio duration, **audio remains 100% in sync without pitch skew or speed warping**
+  - `multiplier`: Scales source framerate by a multiplier (0.5x, 2.0x, etc.)
+  - `target_frame_count`: Forces the output to have an exact number of frames, automatically deriving the matching output framerate
+- **Interpolation Methods**:
+  - `nearest`: Nearest-neighbor frame skipping/duplication (fast, crisp, no ghosting/blur)
+  - `linear`: Smooth linear blending between neighboring frames
+  - `cubic`: Smooth Catmull-Rom cubic interpolation
+- **Outputs**:
+  - `images`: Trimmed/resampled image batch
+  - `audio`: Trimmed, sample-accurate audio track (or None if no audio)
+  - `fps`: Effective output framerate (FLOAT)
+  - `frame_count`: Output frame count (INT)
+  - `trim_info`: Detailed summary of input/output frame counts, framerates, durations, and audio parameters
+
 
 ## Raft Optical Flow Node
 

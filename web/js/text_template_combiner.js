@@ -32,6 +32,7 @@ function installDynamicTextInputs(node) {
     const stringType = "STRING";
     const textInputPattern = /^text_\d+$/;
     const placeholderPattern = /(?<!\{)\{([1-9]\d*)\}(?!\})/g;
+    const choicePattern = /(?<!\{)\{([^{}\n]*\|[^{}\n]*)\}(?!\})/g;
 
     const getWidget = (name) => node.widgets?.find((widget) => widget.name === name);
 
@@ -52,6 +53,14 @@ function installDynamicTextInputs(node) {
             const index = Number.parseInt(match[1], 10);
             if (Number.isFinite(index) && index <= maxInputs) {
                 maxIndex = Math.max(maxIndex, index);
+            }
+        }
+        for (const match of text.matchAll(choicePattern)) {
+            for (const option of match[1].split("|")) {
+                const index = Number.parseInt(option.trim(), 10);
+                if (String(index) === option.trim() && index >= 1 && index <= maxInputs) {
+                    maxIndex = Math.max(maxIndex, index);
+                }
             }
         }
         return maxIndex;

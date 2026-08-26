@@ -1,4 +1,4 @@
-from .Buff import FilePathSelectorFromDirectory, ConsoleOutput, StringProcessor, TwoImageConcatenator, MostRecentFileSelector, RaftOpticalFlowNode, BatchRaftOpticalFlowNode, FrameRateModulator, VideoTransitionBatchMerger, VideoFilterBatch, MultilineTextSplitter, TextTemplateCombiner, LoadTextLineFromFile
+from .Buff import FilePathSelectorFromDirectory, ConsoleOutput, StringProcessor, TwoImageConcatenator, MostRecentFileSelector, RaftOpticalFlowNode, BatchRaftOpticalFlowNode, FrameRateModulator, VideoTransitionBatchMerger, VideoFilterBatch, VideoTrimmer, MultilineTextSplitter, TextTemplateCombiner, LoadTextLineFromFile
 
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -11,6 +11,7 @@ NODE_CLASS_MAPPINGS = {
     "FrameRateModulator": FrameRateModulator,
     "VideoTransitionBatchMerger": VideoTransitionBatchMerger,
     "VideoFilterBatch": VideoFilterBatch,
+    "VideoTrimmer": VideoTrimmer,
     "MultilineTextSplitter": MultilineTextSplitter,
     "TextTemplateCombiner": TextTemplateCombiner,
     "LoadTextLineFromFile": LoadTextLineFromFile,
@@ -26,6 +27,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FrameRateModulator": "Frame Rate Modulator (Buff)",
     "VideoTransitionBatchMerger": "Video Transition Batch Merger (Buff)",
     "VideoFilterBatch": "Video Filter Batch (Buff)",
+    "VideoTrimmer": "Video Trimmer (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
     "TextTemplateCombiner": "Text Template Combiner (Buff)",
     "LoadTextLineFromFile": "Load Text Line From File (Buff)",
@@ -34,3 +36,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 WEB_DIRECTORY = "./web"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+

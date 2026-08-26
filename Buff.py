@@ -913,6 +913,7 @@ class TextTemplateCombiner:
 
     MAX_INPUTS = 20
     PLACEHOLDER_PATTERN = re.compile(r"(?<!\{)\{([1-9]\d*)\}(?!\})")
+    CHOICE_PATTERN = re.compile(r"(?<!\{)\{([^{}\n]*\|[^{}\n]*)\}(?!\})")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -929,7 +930,7 @@ class TextTemplateCombiner:
                 "main": ("STRING", {
                     "default": "",
                     "multiline": True,
-                    "tooltip": "Primary text template. Use {1}, {2}, etc. to insert connected text inputs."
+                    "tooltip": "Primary text template. Use {1}, {2}, etc. to insert connected text inputs. Use {foo|bar} to choose a random option."
                 }),
                 "inputcount": ("INT", {
                     "default": 1,
@@ -955,6 +956,22 @@ class TextTemplateCombiner:
             return value.decode("utf-8", errors="replace")
         return str(value)
 
+    @classmethod
+    def _get_input_reference_index(cls, value):
+        value = value.strip()
+        if not re.fullmatch(r"[1-9]\d*", value):
+            return None
+        index = int(value)
+        if index > cls.MAX_INPUTS:
+            return None
+        return index
+
+    @classmethod
+    def IS_CHANGED(cls, main, inputcount=1, **kwargs):
+        if cls.CHOICE_PATTERN.search(cls._stringify(main)):
+            return float("nan")
+        return ""
+
     def combine_text(self, main, inputcount=1, **kwargs):
         main = self._stringify(main)
         try:
@@ -968,6 +985,12 @@ class TextTemplateCombiner:
             for match in self.PLACEHOLDER_PATTERN.finditer(main)
             if int(match.group(1)) <= self.MAX_INPUTS
         ]
+        for choice_match in self.CHOICE_PATTERN.finditer(main):
+            for option in choice_match.group(1).split("|"):
+                index = self._get_input_reference_index(option)
+                if index is not None:
+                    placeholder_indexes.append(index)
+
         active_count = max([inputcount] + placeholder_indexes) if placeholder_indexes else inputcount
 
         replacements = {
@@ -975,13 +998,27 @@ class TextTemplateCombiner:
             for index in range(1, active_count + 1)
         }
 
+        def resolve_option(option):
+            option = option.strip()
+            index = self._get_input_reference_index(option)
+            if index is not None:
+                return replacements.get(str(index), "")
+            return option
+
+        def replace_choice(match):
+            options = match.group(1).split("|")
+            if not options:
+                return ""
+            return resolve_option(random.choice(options))
+
         def replace_placeholder(match):
             index = match.group(1)
             if int(index) > self.MAX_INPUTS:
                 return match.group(0)
             return replacements.get(index, "")
 
-        return (self.PLACEHOLDER_PATTERN.sub(replace_placeholder, main),)
+        text = self.CHOICE_PATTERN.sub(replace_choice, main)
+        return (self.PLACEHOLDER_PATTERN.sub(replace_placeholder, text),)
 
 
 class BatchRaftOpticalFlowNode:
@@ -3469,6 +3506,590 @@ class VideoFilterBatch:
         return (output.contiguous(), "\n".join(info))
 
 
+class VideoTrimmer:
+    """
+    Trim and modulate the framerate of video / image batches with precise time/frame slicing
+    and sample-accurate audio synchronization (no audio skew).
+    """
+
+    TRIM_MODES = [
+        "all",
+        "start_duration",
+        "start_end",
+        "first_n",
+        "last_n",
+        "center_n",
+        "cut_inside",
+    ]
+
+    TRIM_UNITS = [
+        "seconds",
+        "source_frames",
+        "output_frames",
+        "percentage",
+    ]
+
+    FRAMERATE_MODES = [
+        "keep_source",
+        "custom_fps",
+        "multiplier",
+        "target_frame_count",
+    ]
+
+    INTERPOLATIONS = [
+        "nearest",
+        "linear",
+        "cubic",
+    ]
+
+    LOOP_MODES = [
+        "clamp",
+        "repeat",
+        "mirror",
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "trim_mode": (cls.TRIM_MODES, {
+                    "default": "last_n",
+                    "tooltip": (
+                        "Trimming mode:\n"
+                        "• all: Keep entire video (useful for pure framerate conversion/resampling)\n"
+                        "• start_duration: Trim starting at 'start_value' for duration 'duration_or_count'\n"
+                        "• start_end: Trim between 'start_value' and 'end_value'\n"
+                        "• first_n: Extract first N units (frames/seconds)\n"
+                        "• last_n: Extract last N units (frames/seconds)\n"
+                        "• center_n: Extract center N units around the midpoint\n"
+                        "• cut_inside: Remove segment between start_value and end_value, splicing remaining parts"
+                    )
+                }),
+                "trim_units": (cls.TRIM_UNITS, {
+                    "default": "source_frames",
+                    "tooltip": (
+                        "Units for trim parameters:\n"
+                        "• seconds: Real-world time in seconds\n"
+                        "• source_frames: Frame count / indices based on source framerate\n"
+                        "• output_frames: Frame count based on target output framerate\n"
+                        "• percentage: 0% to 100% (or 0.0 to 1.0) of the video duration"
+                    )
+                }),
+                "start_value": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -100000.0,
+                    "max": 100000.0,
+                    "step": 0.01,
+                    "tooltip": "Start position (can be negative to index from the end, e.g., -2.0s or -48 frames)."
+                }),
+                "duration_or_count": ("FLOAT", {
+                    "default": 24.0,
+                    "min": 0.0,
+                    "max": 100000.0,
+                    "step": 0.01,
+                    "tooltip": "Length/count to extract (0 = until the end of video in start_duration mode)."
+                }),
+                "end_value": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -100000.0,
+                    "max": 100000.0,
+                    "step": 0.01,
+                    "tooltip": "End position for start_end / cut_inside modes (0 = end of video; negative = offset from end)."
+                }),
+                "source_fps": ("FLOAT", {
+                    "default": 24.0,
+                    "min": 0.01,
+                    "max": 1000.0,
+                    "step": 0.01,
+                    "tooltip": "Source video framerate. Auto-detected when native 'video' input is connected unless overridden."
+                }),
+                "framerate_mode": (cls.FRAMERATE_MODES, {
+                    "default": "keep_source",
+                    "tooltip": (
+                        "Framerate / resampling mode:\n"
+                        "• keep_source: Preserve source framerate\n"
+                        "• custom_fps: Resample frames to target_fps while preserving real-world playback speed and audio sync\n"
+                        "• multiplier: Multiply source framerate by fps_multiplier\n"
+                        "• target_frame_count: Produce exact target_frame_count output frames (auto-calculates output fps)"
+                    )
+                }),
+                "target_fps": ("FLOAT", {
+                    "default": 24.0,
+                    "min": 0.01,
+                    "max": 1000.0,
+                    "step": 0.01,
+                    "tooltip": "Target framerate used when framerate_mode is 'custom_fps'."
+                }),
+                "fps_multiplier": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.01,
+                    "max": 100.0,
+                    "step": 0.01,
+                    "tooltip": "Framerate scaling factor used when framerate_mode is 'multiplier' (e.g., 0.5 = half fps, 2.0 = double fps)."
+                }),
+                "target_frame_count": ("INT", {
+                    "default": 24,
+                    "min": 1,
+                    "max": 100000,
+                    "step": 1,
+                    "tooltip": "Exact number of output frames when framerate_mode is 'target_frame_count'."
+                }),
+                "interpolation": (cls.INTERPOLATIONS, {
+                    "default": "nearest",
+                    "tooltip": (
+                        "Frame interpolation method:\n"
+                        "• nearest: Frame skipping/duplication (crisp, zero motion blur/ghosting)\n"
+                        "• linear: Linear blend between adjacent frames\n"
+                        "• cubic: Smooth cubic interpolation"
+                    )
+                }),
+                "loop_mode": (cls.LOOP_MODES, {
+                    "default": "clamp",
+                    "tooltip": "How to handle boundary frames (clamp to edge, repeat, or mirror)."
+                }),
+            },
+            "optional": {
+                "video": ("VIDEO", {
+                    "tooltip": "Optional native ComfyUI Video object (e.g. from LoadVideo or CreateVideo)."
+                }),
+                "images": ("IMAGE", {
+                    "tooltip": "Optional batch of images [B, H, W, C]."
+                }),
+                "audio": ("AUDIO,VHS_AUDIO", {
+                    "tooltip": "Optional audio track (ComfyUI AUDIO dict or VHS_AUDIO)."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "STRING")
+    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "trim_info")
+    FUNCTION = "trim_video"
+    CATEGORY = "Image/Animation"
+
+    def _coerce_audio(self, audio, name="audio"):
+        if audio is None:
+            return None
+        if isinstance(audio, Mapping):
+            if "waveform" in audio and "sample_rate" in audio:
+                return {"waveform": audio["waveform"], "sample_rate": audio["sample_rate"]}
+            return audio
+        if callable(audio):
+            try:
+                payload = audio()
+            except Exception as e:
+                print(f"[VideoTrimmer] Failed to call VHS_AUDIO callable: {e}")
+                return None
+            if not payload:
+                return None
+            try:
+                import av
+                if isinstance(payload, bytes):
+                    container_input = io.BytesIO(payload)
+                elif isinstance(payload, str) and os.path.exists(payload):
+                    container_input = payload
+                else:
+                    container_input = io.BytesIO(payload)
+                with av.open(container_input, mode="r") as container:
+                    if not container.streams.audio:
+                        return None
+                    stream = container.streams.audio[0]
+                    sample_rate = int(stream.codec_context.sample_rate) if stream.codec_context.sample_rate else 44100
+                    resampler = av.AudioResampler(format="fltp", layout="stereo", rate=sample_rate)
+                    chunks = []
+                    for frame in container.decode(streams=stream.index):
+                        for r_frame in resampler.resample(frame):
+                            chunks.append(torch.from_numpy(r_frame.to_ndarray().copy()))
+                    for r_frame in resampler.resample(None):
+                        chunks.append(torch.from_numpy(r_frame.to_ndarray().copy()))
+                    if not chunks:
+                        return None
+                    waveform = torch.cat(chunks, dim=-1).unsqueeze(0).float()
+                    return {"waveform": waveform, "sample_rate": sample_rate}
+            except Exception as e:
+                print(f"[VideoTrimmer] Failed to decode audio payload: {e}")
+                return None
+        return None
+
+    def _extract_inputs(self, video=None, images=None, audio=None, source_fps=24.0):
+        detected_fps = None
+        extracted_images = None
+        extracted_audio = None
+
+        if video is not None:
+            if hasattr(video, "get_components") and callable(video.get_components):
+                try:
+                    comps = video.get_components()
+                    extracted_images = comps.images
+                    extracted_audio = comps.audio
+                    if comps.frame_rate:
+                        detected_fps = float(comps.frame_rate)
+                except Exception as e:
+                    print(f"[VideoTrimmer] Warning: Failed to extract components from video: {e}")
+            elif isinstance(video, Mapping):
+                extracted_images = video.get("images")
+                extracted_audio = video.get("audio")
+                if "frame_rate" in video:
+                    detected_fps = float(video["frame_rate"])
+                elif "fps" in video:
+                    detected_fps = float(video["fps"])
+
+        if images is not None:
+            extracted_images = images
+
+        if audio is not None:
+            extracted_audio = audio
+
+        if extracted_images is None:
+            raise ValueError("VideoTrimmer: No image or video input provided. Please connect 'video' or 'images'.")
+
+        if not isinstance(extracted_images, torch.Tensor) or extracted_images.ndim != 4:
+            raise ValueError(f"VideoTrimmer: 'images' must be a 4D torch.Tensor [frames, height, width, channels], got {type(extracted_images)}.")
+
+        if extracted_images.shape[0] == 0:
+            raise ValueError("VideoTrimmer: Input image batch contains 0 frames.")
+
+        if detected_fps is not None and detected_fps > 0:
+            if source_fps == 24.0:
+                effective_source_fps = detected_fps
+            else:
+                effective_source_fps = float(source_fps)
+        else:
+            effective_source_fps = max(0.001, float(source_fps))
+
+        return extracted_images, extracted_audio, effective_source_fps, detected_fps
+
+    def _to_seconds(self, val, units, input_fps, target_fps, total_duration):
+        if units == "seconds":
+            return float(val)
+        elif units == "source_frames":
+            return float(val) / input_fps
+        elif units == "output_frames":
+            return float(val) / target_fps
+        elif units == "percentage":
+            p = float(val)
+            if abs(p) > 1.0 and abs(p) <= 100.0:
+                p = p / 100.0
+            return p * total_duration
+        return float(val)
+
+    def _get_frame_at_position(self, images, position, loop_mode="clamp"):
+        total_frames = images.shape[0]
+        if total_frames == 1:
+            return images[0]
+        if loop_mode == "clamp":
+            idx = max(0, min(total_frames - 1, int(position)))
+            return images[idx]
+        elif loop_mode == "repeat":
+            idx = int(position) % total_frames
+            return images[idx]
+        elif loop_mode == "mirror":
+            cycle_length = (total_frames - 1) * 2
+            if cycle_length <= 0:
+                return images[0]
+            pos_in_cycle = int(position) % cycle_length
+            if pos_in_cycle < total_frames:
+                return images[pos_in_cycle]
+            else:
+                mirror_idx = cycle_length - pos_in_cycle
+                return images[mirror_idx]
+        return images[0]
+
+    def _interpolate_positions(self, images, positions, interpolation="nearest", loop_mode="clamp"):
+        total_frames = images.shape[0]
+        if total_frames == 0 or len(positions) == 0:
+            return images[:0]
+
+        device = images.device
+        dtype = images.dtype
+        num_out = len(positions)
+        _, h, w, c = images.shape
+
+        if interpolation == "nearest":
+            indices = []
+            for pos in positions:
+                idx = int(round(pos))
+                if loop_mode == "clamp":
+                    idx = max(0, min(total_frames - 1, idx))
+                elif loop_mode == "repeat":
+                    idx = idx % total_frames
+                elif loop_mode == "mirror":
+                    cycle = (total_frames - 1) * 2
+                    if cycle > 0:
+                        p = idx % cycle
+                        idx = p if p < total_frames else cycle - p
+                    else:
+                        idx = 0
+                indices.append(idx)
+            return images[indices]
+
+        result = torch.zeros((num_out, h, w, c), dtype=dtype, device=device)
+        for i, pos in enumerate(positions):
+            if interpolation == "linear":
+                pos_floor = int(np.floor(pos))
+                pos_ceil = pos_floor + 1
+                alpha = float(pos - pos_floor)
+                f_a = self._get_frame_at_position(images, pos_floor, loop_mode)
+                f_b = self._get_frame_at_position(images, pos_ceil, loop_mode)
+                result[i] = f_a * (1.0 - alpha) + f_b * alpha
+            elif interpolation == "cubic":
+                pos_int = int(np.floor(pos))
+                alpha = float(pos - pos_int)
+                p0 = self._get_frame_at_position(images, pos_int - 1, loop_mode)
+                p1 = self._get_frame_at_position(images, pos_int, loop_mode)
+                p2 = self._get_frame_at_position(images, pos_int + 1, loop_mode)
+                p3 = self._get_frame_at_position(images, pos_int + 2, loop_mode)
+                a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+                b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3
+                c = -0.5 * p0 + 0.5 * p2
+                d = p1
+                result[i] = torch.clamp(a * (alpha ** 3) + b * (alpha ** 2) + c * alpha + d, 0.0, 1.0)
+            else:
+                result[i] = self._get_frame_at_position(images, int(round(pos)), loop_mode)
+        return result
+
+    def _slice_audio(self, audio, intervals):
+        if audio is None:
+            return None
+
+        coerced = self._coerce_audio(audio)
+        if coerced is None:
+            return None
+
+        waveform = coerced["waveform"]
+        if not isinstance(waveform, torch.Tensor):
+            return None
+
+        sr = int(coerced.get("sample_rate", 44100))
+        if sr <= 0:
+            sr = 44100
+
+        if waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)
+        elif waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0).unsqueeze(0)
+
+        total_samples = waveform.shape[-1]
+        sliced_pieces = []
+
+        for t_start, t_end in intervals:
+            t_dur = max(0.0, t_end - t_start)
+            expected_samples = max(0, int(round(t_dur * sr)))
+            if expected_samples == 0:
+                continue
+
+            start_samp = max(0, int(round(t_start * sr)))
+            end_samp = min(total_samples, int(round(t_end * sr)))
+
+            if start_samp >= total_samples:
+                piece = torch.zeros((1, waveform.shape[1], expected_samples), dtype=waveform.dtype, device=waveform.device)
+            else:
+                actual = waveform[..., start_samp:end_samp]
+                if actual.shape[-1] < expected_samples:
+                    pad_len = expected_samples - actual.shape[-1]
+                    pad = torch.zeros((1, waveform.shape[1], pad_len), dtype=waveform.dtype, device=waveform.device)
+                    piece = torch.cat([actual, pad], dim=-1)
+                elif actual.shape[-1] > expected_samples:
+                    piece = actual[..., :expected_samples]
+                else:
+                    piece = actual
+            sliced_pieces.append(piece)
+
+        if not sliced_pieces:
+            return None
+
+        if len(sliced_pieces) == 1:
+            final_waveform = sliced_pieces[0]
+        else:
+            final_waveform = torch.cat(sliced_pieces, dim=-1)
+
+        return {"waveform": final_waveform, "sample_rate": sr}
+
+    def trim_video(
+        self,
+        trim_mode,
+        trim_units,
+        start_value,
+        duration_or_count,
+        end_value,
+        source_fps,
+        framerate_mode,
+        target_fps,
+        fps_multiplier,
+        target_frame_count,
+        interpolation="nearest",
+        loop_mode="clamp",
+        video=None,
+        images=None,
+        audio=None,
+    ):
+        extracted_images, extracted_audio, input_fps, detected_fps = self._extract_inputs(
+            video=video, images=images, audio=audio, source_fps=source_fps
+        )
+
+        total_frames = extracted_images.shape[0]
+        total_duration = total_frames / input_fps
+
+        if framerate_mode == "keep_source":
+            out_fps = input_fps
+        elif framerate_mode == "custom_fps":
+            out_fps = max(0.01, float(target_fps))
+        elif framerate_mode == "multiplier":
+            out_fps = max(0.01, input_fps * max(0.001, float(fps_multiplier)))
+        elif framerate_mode == "target_frame_count":
+            out_fps = None
+
+        ref_target_fps = out_fps if out_fps is not None else input_fps
+
+        intervals = []
+
+        if trim_mode == "all":
+            intervals.append((0.0, total_duration))
+
+        elif trim_mode == "start_duration":
+            t_start = self._to_seconds(start_value, trim_units, input_fps, ref_target_fps, total_duration)
+            if t_start < 0:
+                t_start = max(0.0, total_duration + t_start)
+            else:
+                t_start = min(total_duration, max(0.0, t_start))
+
+            if duration_or_count <= 0:
+                t_end = total_duration
+            else:
+                t_dur = self._to_seconds(duration_or_count, trim_units, input_fps, ref_target_fps, total_duration)
+                t_end = min(total_duration, t_start + max(0.0, t_dur))
+            intervals.append((t_start, t_end))
+
+        elif trim_mode == "start_end":
+            t_start = self._to_seconds(start_value, trim_units, input_fps, ref_target_fps, total_duration)
+            if t_start < 0:
+                t_start = max(0.0, total_duration + t_start)
+            else:
+                t_start = min(total_duration, max(0.0, t_start))
+
+            if end_value == 0.0 and start_value != 0.0:
+                t_end = total_duration
+            else:
+                t_end = self._to_seconds(end_value, trim_units, input_fps, ref_target_fps, total_duration)
+                if t_end < 0:
+                    t_end = max(0.0, total_duration + t_end)
+                elif t_end == 0.0:
+                    t_end = total_duration
+                else:
+                    t_end = min(total_duration, max(0.0, t_end))
+
+            if t_end < t_start:
+                t_start, t_end = t_end, t_start
+            intervals.append((t_start, t_end))
+
+        elif trim_mode == "first_n":
+            n_val = duration_or_count if duration_or_count > 0 else start_value
+            t_len = max(0.0, self._to_seconds(n_val, trim_units, input_fps, ref_target_fps, total_duration))
+            t_end = min(total_duration, t_len)
+            intervals.append((0.0, t_end))
+
+        elif trim_mode == "last_n":
+            n_val = duration_or_count if duration_or_count > 0 else start_value
+            t_len = max(0.0, self._to_seconds(n_val, trim_units, input_fps, ref_target_fps, total_duration))
+            t_len = min(total_duration, t_len)
+            t_start = max(0.0, total_duration - t_len)
+            intervals.append((t_start, total_duration))
+
+        elif trim_mode == "center_n":
+            n_val = duration_or_count if duration_or_count > 0 else start_value
+            t_len = max(0.0, self._to_seconds(n_val, trim_units, input_fps, ref_target_fps, total_duration))
+            t_len = min(total_duration, t_len)
+            t_start = max(0.0, (total_duration - t_len) / 2.0)
+            t_end = min(total_duration, t_start + t_len)
+            intervals.append((t_start, t_end))
+
+        elif trim_mode == "cut_inside":
+            t_cut_start = self._to_seconds(start_value, trim_units, input_fps, ref_target_fps, total_duration)
+            if t_cut_start < 0:
+                t_cut_start = max(0.0, total_duration + t_cut_start)
+            else:
+                t_cut_start = min(total_duration, max(0.0, t_cut_start))
+
+            t_cut_end = self._to_seconds(end_value, trim_units, input_fps, ref_target_fps, total_duration)
+            if t_cut_end < 0:
+                t_cut_end = max(0.0, total_duration + t_cut_end)
+            else:
+                t_cut_end = min(total_duration, max(0.0, t_cut_end))
+
+            if t_cut_end < t_cut_start:
+                t_cut_start, t_cut_end = t_cut_end, t_cut_start
+
+            if t_cut_start > 0.0:
+                intervals.append((0.0, t_cut_start))
+            if t_cut_end < total_duration:
+                intervals.append((t_cut_end, total_duration))
+            if len(intervals) == 0:
+                intervals.append((0.0, min(total_duration, 1.0 / input_fps)))
+
+        trimmed_duration = sum(max(0.0, t_e - t_s) for t_s, t_e in intervals)
+        if trimmed_duration <= 0.0:
+            trimmed_duration = 1.0 / input_fps
+
+        if framerate_mode == "target_frame_count":
+            target_count = max(1, int(target_frame_count))
+            out_fps = max(0.01, float(target_count) / max(1e-6, trimmed_duration))
+        else:
+            out_fps = float(out_fps)
+
+        output_frame_batches = []
+        for t_s, t_e in intervals:
+            t_seg = max(0.0, t_e - t_s)
+            if t_seg <= 0.0:
+                continue
+
+            if framerate_mode == "target_frame_count" and len(intervals) == 1:
+                n_frames = max(1, int(target_frame_count))
+            else:
+                n_frames = max(1, int(round(t_seg * out_fps)))
+
+            positions = []
+            for i in range(n_frames):
+                t_pos = t_s + (i / out_fps)
+                pos = t_pos * input_fps
+                positions.append(pos)
+
+            seg_frames = self._interpolate_positions(
+                extracted_images, positions, interpolation=interpolation, loop_mode=loop_mode
+            )
+            output_frame_batches.append(seg_frames)
+
+        if len(output_frame_batches) == 0:
+            output_images = extracted_images[:1]
+        elif len(output_frame_batches) == 1:
+            output_images = output_frame_batches[0]
+        else:
+            output_images = torch.cat(output_frame_batches, dim=0)
+
+        output_frame_count = int(output_images.shape[0])
+        output_audio = self._slice_audio(extracted_audio, intervals)
+
+        intervals_str = ", ".join([f"[{ts:.2f}s - {te:.2f}s]" for ts, te in intervals])
+        audio_info_str = "None"
+        if output_audio is not None:
+            wf = output_audio["waveform"]
+            sr = output_audio["sample_rate"]
+            channels = wf.shape[1] if wf.ndim >= 2 else 1
+            samples = wf.shape[-1]
+            audio_dur = samples / sr
+            audio_info_str = f"{channels} ch @ {sr} Hz ({samples} samples, {audio_dur:.2f}s)"
+
+        trim_info = "\n".join([
+            f"[Video Trimmer (Buff)]",
+            f"Input: {total_frames} frames @ {input_fps:.2f} fps ({total_duration:.2f}s) | Size: {extracted_images.shape[2]}x{extracted_images.shape[1]}",
+            f"Trim Mode: {trim_mode} | Units: {trim_units} | Windows: {intervals_str} | Duration: {trimmed_duration:.2f}s",
+            f"Output: {output_frame_count} frames @ {out_fps:.2f} fps ({output_frame_count / out_fps:.2f}s) | Interpolation: {interpolation}",
+            f"Audio: {audio_info_str}",
+        ])
+
+        print(trim_info)
+
+        return (output_images, output_audio, float(out_fps), output_frame_count, trim_info)
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "FilePathSelectorFromDirectory": FilePathSelectorFromDirectory,
@@ -3480,6 +4101,7 @@ NODE_CLASS_MAPPINGS = {
     "FrameRateModulator": FrameRateModulator,
     "VideoTransitionBatchMerger": VideoTransitionBatchMerger,
     "VideoFilterBatch": VideoFilterBatch,
+    "VideoTrimmer": VideoTrimmer,
     "MostRecentFileSelector": MostRecentFileSelector,
     "MultilineTextSplitter": MultilineTextSplitter,
     "TextTemplateCombiner": TextTemplateCombiner,
@@ -3496,8 +4118,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FrameRateModulator": "Frame Rate Modulator (Buff)",
     "VideoTransitionBatchMerger": "Video Transition Batch Merger (Buff)",
     "VideoFilterBatch": "Video Filter Batch (Buff)",
+    "VideoTrimmer": "Video Trimmer (Buff)",
     "MostRecentFileSelector": "Most Recent File Selector (Buff)",
     "MultilineTextSplitter": "Multiline Text Splitter (Buff)",
     "TextTemplateCombiner": "Text Template Combiner (Buff)",
     "LoadTextLineFromFile": "Load Text Line From File (Buff)"
 }
+
